@@ -3,7 +3,7 @@ import { ladderSpec, loadConfig, roleOverride, type OrcaConfig, type Role, type 
 import { detectProject, type ProjectInfo } from './detect.ts';
 import { commitAll, diffRange, diffSince, headCommit, isDirty, isGitRepo, startBranch } from './git.ts';
 import { runProcess } from './backends/proc.ts';
-import { runRedCheck, type RedCheckOptions, type TaskProof } from './redgreen.ts';
+import { runRedCheck, type ProofStatus, type RedCheckOptions, type TaskProof } from './redgreen.ts';
 import {
   INSTRUCTIONS,
   PLAN_SCHEMA,
@@ -588,7 +588,26 @@ async function execute(ctx: Active, autoApprove: boolean): Promise<RunState> {
   return s;
 }
 
+/** Ícono y etiqueta en español de cada estado de la prueba red→green. */
+export const PROOF_LABELS: Record<ProofStatus, string> = {
+  proven: '🟢 red→green probado',
+  'not-red': '🟠 tests no fallan sin el cambio',
+  inconclusive: '➖ prueba no concluyente',
+  'no-tests': '⚪ sin tests nuevos',
+  skipped: '⏭ prueba omitida',
+};
+
+/** Sufijo de una línea de tarea del reporte: prueba red→green y revisión propia (si existen). */
+export function taskReportSuffix(t?: TaskRecord): string {
+  const parts: string[] = [];
+  if (t?.proof) parts.push(PROOF_LABELS[t.proof.status] ?? `prueba: ${t.proof.status}`);
+  if (t?.review) parts.push(`revisión: ${t.review.verdict}, ${highIssues(t.review).length} high`);
+  return parts.length ? ` · ${parts.join(' · ')}` : '';
+}
+
 export function renderReport(s: RunState): string {
+  const planTasks = s.plan?.tasks ?? [];
+  const unproven = planTasks.filter((t) => s.tasks[t.id]?.proof && s.tasks[t.id]?.proof?.status !== 'proven');
   const lines = [
     `# orcatech · ${s.id}`,
     '',
@@ -599,8 +618,14 @@ export function renderReport(s: RunState): string {
     s.error ? `\n> ⚠ ${s.error}` : '',
     '',
     '## Tareas',
-    ...(s.plan?.tasks ?? []).map((t) => `- ${s.tasks[t.id]?.status === 'passed' ? '✅' : s.tasks[t.id]?.status === 'failed' ? '❌' : '⏳'} [${t.id}] ${t.title} — ${s.tasks[t.id]?.account}${s.tasks[t.id]?.commit ? ` (${s.tasks[t.id]?.commit})` : ''}`),
+    ...planTasks.map((t) => `- ${s.tasks[t.id]?.status === 'passed' ? '✅' : s.tasks[t.id]?.status === 'failed' ? '❌' : '⏳'} [${t.id}] ${t.title} — ${s.tasks[t.id]?.account}${s.tasks[t.id]?.commit ? ` (${s.tasks[t.id]?.commit})` : ''}${taskReportSuffix(s.tasks[t.id])}`),
   ];
+  if (unproven.length) {
+    lines.push('', '## Prueba red→green', ...unproven.map((t) => {
+      const p = s.tasks[t.id]!.proof!;
+      return `- [${t.id}] ${PROOF_LABELS[p.status] ?? p.status}: ${p.detail}`;
+    }));
+  }
   if (s.testReport) {
     lines.push('', '## Aceptación', s.testReport.summary, ...s.testReport.criteria.map((c) => `- ${c.status === 'pass' ? '✅' : c.status === 'fail' ? '❌' : '➖'} ${c.criterion}`));
   }

@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { accountEnv, extractJson } from '../src/backends/types.ts';
 import { DEFAULT_CONFIG, ladderSpec, loadConfig, roleOverride } from '../src/config.ts';
 import { detectProject } from '../src/detect.ts';
-import { highIssues, proveTask, proofLogText, resolveFixerRole, reviewTask, type ProofDeps, type ProofInput, type TaskReviewDeps, type TaskReviewInput } from '../src/pipeline.ts';
+import { PROOF_LABELS, highIssues, proveTask, proofLogText, renderReport, resolveFixerRole, reviewTask, type ProofDeps, type ProofInput, type TaskReviewDeps, type TaskReviewInput } from '../src/pipeline.ts';
 import { PLAN_SCHEMA, REVIEW_SCHEMA, TEST_SCHEMA, fixPrompt, strengthenTestsPrompt, taskReviewPrompt, type Plan, type Review } from '../src/prompts.ts';
 import { changedFiles, diffRange, headCommit, showFile } from '../src/git.ts';
 import { classifyRedRun, isTestFile, newSourceFiles, pickTestFiles, runRedCheck } from '../src/redgreen.ts';
@@ -218,6 +218,40 @@ test('RunState acepta el resultado de la prueba red→green por tarea', () => {
   };
   assert.equal(tasks.T1.proof?.status, 'proven');
   assert.equal(tasks.T2.proof, undefined);
+});
+
+function reportState(tasks: RunState['tasks']): RunState {
+  const now = new Date().toISOString();
+  const planTask = (id: string) => ({ id, title: `Tarea ${id}`, description: 'd', kind: 'backend', acceptance: [] });
+  return {
+    id: 'r1', idea: 'idea', repo: '/tmp/x', status: 'done', createdAt: now, updatedAt: now, projectType: 'node',
+    roles: DEFAULT_CONFIG.roles,
+    plan: { summary: 's', testCommand: 'npm test', tasks: Object.keys(tasks).map(planTask) } as unknown as Plan,
+    tasks, steps: [], costUsd: 0, tokens: { input: 0, output: 0 },
+  };
+}
+
+test('renderReport muestra la prueba red→green, la revisión por tarea y el detail de las no probadas', () => {
+  const md = renderReport(reportState({
+    T1: { status: 'passed', attempts: 0, account: 'codex', commit: 'aaa', proof: { status: 'proven', detail: 'falló sin el cambio', testFiles: ['test/a.test.ts'] },
+      review: { verdict: 'changes', summary: 's', issues: [{ severity: 'high', file: 'a.ts', description: 'x' }, { severity: 'low', file: 'a.ts', description: 'y' }] } },
+    T2: { status: 'passed', attempts: 1, account: 'codex', proof: { status: 'not-red', detail: 'los tests pasan en el commit previo', testFiles: ['test/b.test.ts'] } },
+    T3: { status: 'passed', attempts: 0, account: 'codex' },
+  }));
+  assert.match(md, /\[T1\] Tarea T1 .*🟢 red→green probado · revisión: changes, 1 high/);
+  assert.match(md, /\[T2\] Tarea T2 .*🟠 tests no fallan sin el cambio/);
+  assert.match(md, /## Prueba red→green\n- \[T2\] 🟠 tests no fallan sin el cambio: los tests pasan en el commit previo/);
+  assert.doesNotMatch(md, /- \[T1\] 🟢/, 'las tareas proven no van en la sección de detalle');
+  const t3 = md.split('\n').find((l) => l.includes('[T3]'));
+  assert.equal(t3, '- ✅ [T3] Tarea T3 — codex');
+});
+
+test('renderReport de una corrida vieja sin proof ni review no incluye la sección red→green', () => {
+  const md = renderReport(reportState({ T1: { status: 'passed', attempts: 0, account: 'codex' } }));
+  assert.doesNotMatch(md, /red→green/);
+  assert.equal(PROOF_LABELS.skipped, '⏭ prueba omitida');
+  assert.equal(PROOF_LABELS['no-tests'], '⚪ sin tests nuevos');
+  assert.equal(PROOF_LABELS.inconclusive, '➖ prueba no concluyente');
 });
 
 // ---- Integración con un repo git temporal real ----

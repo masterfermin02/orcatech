@@ -121,6 +121,27 @@ async function select(id) {
   renderDetail();
 }
 
+const PROOF_ES = {
+  proven: ['red→green probado', 'ok'],
+  'not-red': ['tests no fallan sin el cambio', 'warn'],
+  inconclusive: ['prueba no concluyente', 'muted'],
+  'no-tests': ['sin tests nuevos', 'muted'],
+  skipped: ['prueba omitida', 'muted'],
+};
+
+function proofChip(p) {
+  if (!p || !p.status) return '';
+  const [label, tone] = PROOF_ES[p.status] || [p.status, 'muted'];
+  return `<span class="chip" style="color:var(--${tone})" title="${esc(p.detail || '')}">${esc(label)}</span>`;
+}
+
+function taskReviewChip(rv) {
+  if (!rv || !rv.verdict) return '';
+  const high = (rv.issues || []).filter((i) => i.severity === 'high').length;
+  const tone = rv.verdict === 'approve' && !high ? 'ok' : 'warn';
+  return `<span class="chip" style="color:var(--${tone})" title="${esc(rv.summary || '')}">revisión: ${esc(rv.verdict)} · ${high} high</span>`;
+}
+
 function renderDetail() {
   const d = detail;
   if (!d) return;
@@ -132,7 +153,7 @@ function renderDetail() {
     return `<div class="task">
       <div class="head"><b>[${esc(t.id)}] ${esc(t.title)}</b><span class="chip">${esc(t.kind)}</span>
         ${waiting ? `<select data-task="${i}">${accountOptions(acct)}</select><button class="danger" data-drop="${i}" type="button">Quitar</button>`
-                  : `<span class="muted">${esc(acct || '')}</span><span class="st-${ts.status === 'passed' ? 'done' : ts.status === 'failed' ? 'failed' : ''}">${esc(ts.status || '')}${ts.attempts ? ` · ${ts.attempts} reparación(es)` : ''}${ts.commit ? ` · ${esc(ts.commit)}` : ''}</span>`}
+                  : `<span class="muted">${esc(acct || '')}</span><span class="st-${ts.status === 'passed' ? 'done' : ts.status === 'failed' ? 'failed' : ''}">${esc(ts.status || '')}${ts.attempts ? ` · ${ts.attempts} reparación(es)` : ''}${ts.commit ? ` · ${esc(ts.commit)}` : ''}</span>${proofChip(ts.proof)}${taskReviewChip(ts.review)}`}
       </div>
       <div>${esc(t.description)}</div>
       <ul>${t.acceptance.map((a) => `<li>${esc(a)}</li>`).join('')}</ul>
