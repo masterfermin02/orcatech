@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { accountEnv, extractJson } from '../src/backends/types.ts';
-import { DEFAULT_CONFIG, loadConfig, roleOverride } from '../src/config.ts';
+import { DEFAULT_CONFIG, ladderSpec, loadConfig, roleOverride } from '../src/config.ts';
 import { detectProject } from '../src/detect.ts';
 import { PLAN_SCHEMA, REVIEW_SCHEMA, TEST_SCHEMA } from '../src/prompts.ts';
 
@@ -41,6 +41,48 @@ test('loadConfig mezcla la config del proyecto y valida cuentas', () => {
   assert.equal(cfg.routing.frontend, 'claude-work');
   writeFileSync(join(repo, 'orcatech.config.json'), JSON.stringify({ roles: { coder: { account: 'no-existe' } } }));
   assert.throws(() => loadConfig(repo), /no existe/);
+});
+
+test('DEFAULT_CONFIG activa redGreen y reviewEachTask, sin fixerLadder', () => {
+  assert.equal(DEFAULT_CONFIG.redGreen, true);
+  assert.equal(DEFAULT_CONFIG.reviewEachTask, true);
+  assert.equal(DEFAULT_CONFIG.fixerLadder, undefined);
+});
+
+test('loadConfig lee redGreen, reviewEachTask y fixerLadder del proyecto', () => {
+  const repo = tmp();
+  const cfgPath = join(repo, 'orcatech.config.json');
+  writeFileSync(cfgPath, JSON.stringify({ redGreen: false, reviewEachTask: false, fixerLadder: ['codex', 'claude-personal:claude-opus-5-5'] }));
+  const cfg = loadConfig(repo);
+  assert.equal(cfg.redGreen, false);
+  assert.equal(cfg.reviewEachTask, false);
+  assert.deepEqual(cfg.fixerLadder, ['codex', 'claude-personal:claude-opus-5-5']);
+
+  // Un override que no trae las claves (o las trae undefined) no borra lo heredado.
+  const kept = loadConfig(repo, { fixerLadder: undefined });
+  assert.deepEqual(kept.fixerLadder, ['codex', 'claude-personal:claude-opus-5-5']);
+  assert.equal(kept.redGreen, false);
+  // El array del override reemplaza al base, no se concatena.
+  assert.deepEqual(loadConfig(repo, { fixerLadder: ['claude-work'] }).fixerLadder, ['claude-work']);
+
+  writeFileSync(cfgPath, JSON.stringify({}));
+  const defaults = loadConfig(repo);
+  assert.equal(defaults.redGreen, true);
+  assert.equal(defaults.reviewEachTask, true);
+  assert.equal(defaults.fixerLadder, undefined);
+
+  writeFileSync(cfgPath, JSON.stringify({ fixerLadder: ['codex', 'x:modelo'] }));
+  assert.throws(() => loadConfig(repo), /fixerLadder\[1\] apunta a la cuenta inexistente "x"/);
+});
+
+test('ladderSpec elige el escalón según el intento', () => {
+  assert.equal(ladderSpec(undefined, 1), undefined);
+  assert.equal(ladderSpec([], 2), undefined);
+  assert.equal(ladderSpec(['a', 'b'], 1), 'a');
+  assert.equal(ladderSpec(['a', 'b'], 2), 'b');
+  assert.equal(ladderSpec(['a', 'b'], 5), 'b');
+  assert.equal(ladderSpec(['a', 'b'], 0), 'a');
+  assert.equal(ladderSpec(['a', 'b'], -3), 'a');
 });
 
 test('detectProject reconoce Laravel, juego de navegador y Python', () => {

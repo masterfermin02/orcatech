@@ -30,6 +30,18 @@ export interface OrcaConfig {
   git: boolean;
   /** Comando de tests; si falta, se detecta según el proyecto. */
   testCommand?: string;
+  /**
+   * Prueba red→green por tarea: los tests que agregó o cambió la tarea se corren
+   * contra el commit previo (en un worktree temporal) y deben fallar ahí.
+   */
+  redGreen: boolean;
+  /** Revisar el diff de cada tarea con el reviewer y mandar los hallazgos high al fixer. */
+  reviewEachTask: boolean;
+  /**
+   * Escalera de fixers: specs 'cuenta[:modelo]'. El intento N usa
+   * fixerLadder[min(N-1, len-1)]. Si falta, se usa siempre `roles.fixer`.
+   */
+  fixerLadder?: string[];
   port: number;
 }
 
@@ -59,6 +71,8 @@ export const DEFAULT_CONFIG: OrcaConfig = {
   maxFixAttempts: 3,
   maxRunBudgetUsd: 25,
   git: true,
+  redGreen: true,
+  reviewEachTask: true,
   port: 4317,
 };
 
@@ -76,9 +90,12 @@ function readJson(path: string): Partial<OrcaConfig> {
 }
 
 function merge(base: OrcaConfig, over: Partial<OrcaConfig>): OrcaConfig {
+  // Escalares y arrays del override reemplazan al valor base; una clave ausente
+  // (o explícitamente undefined) no borra el valor heredado.
+  const defined = Object.fromEntries(Object.entries(over).filter(([, v]) => v !== undefined)) as Partial<OrcaConfig>;
   return {
     ...base,
-    ...over,
+    ...defined,
     accounts: { ...base.accounts, ...over.accounts },
     roles: Object.fromEntries(ROLES.map((r) => [r, { ...base.roles[r], ...over.roles?.[r] }])) as OrcaConfig['roles'],
     routing: { ...base.routing, ...over.routing },
@@ -102,6 +119,24 @@ export function validate(cfg: OrcaConfig): void {
   for (const [kind, acct] of Object.entries(cfg.routing)) {
     if (!cfg.accounts[acct]) throw new Error(`routing.${kind} apunta a la cuenta inexistente "${acct}"`);
   }
+  if (cfg.fixerLadder !== undefined && !Array.isArray(cfg.fixerLadder)) {
+    throw new Error('fixerLadder debe ser una lista de specs "cuenta[:modelo]"');
+  }
+  (cfg.fixerLadder ?? []).forEach((spec, i) => {
+    const acct = String(spec).split(':')[0];
+    if (!cfg.accounts[acct]) throw new Error(`fixerLadder[${i}] apunta a la cuenta inexistente "${acct}"`);
+  });
+}
+
+/**
+ * Spec de la escalera de fixers para el intento `attempt` (empieza en 1):
+ * ladder[min(attempt-1, len-1)]. Con attempt < 1 se usa el índice 0.
+ * Devuelve undefined si no hay escalera o está vacía.
+ */
+export function ladderSpec(ladder: string[] | undefined, attempt: number): string | undefined {
+  if (!ladder?.length) return undefined;
+  const i = Math.min(Math.max(Math.floor(attempt) - 1, 0), ladder.length - 1);
+  return ladder[i];
 }
 
 /**

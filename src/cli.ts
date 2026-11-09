@@ -163,6 +163,10 @@ function cmdInit() {
     maxFixAttempts: DEFAULT_CONFIG.maxFixAttempts,
     maxRunBudgetUsd: DEFAULT_CONFIG.maxRunBudgetUsd,
     git: true,
+    redGreen: DEFAULT_CONFIG.redGreen,
+    reviewEachTask: DEFAULT_CONFIG.reviewEachTask,
+    $commentFixerLadder:
+      'Opcional: "fixerLadder": ["codex", "claude-personal:claude-opus-5-5"]. El intento N del fixer usa ladder[min(N-1, len-1)].',
   };
   writeFileSync(target, JSON.stringify(example, null, 2) + '\n');
   console.log(`Creado ${target}`);
