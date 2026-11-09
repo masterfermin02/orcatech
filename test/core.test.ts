@@ -1,13 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { accountEnv, extractJson } from '../src/backends/types.ts';
 import { DEFAULT_CONFIG, ladderSpec, loadConfig, roleOverride } from '../src/config.ts';
 import { detectProject } from '../src/detect.ts';
 import { PLAN_SCHEMA, REVIEW_SCHEMA, TEST_SCHEMA } from '../src/prompts.ts';
-import { classifyRedRun, isTestFile, newSourceFiles, pickTestFiles } from '../src/redgreen.ts';
+import { changedFiles, diffRange, headCommit, showFile } from '../src/git.ts';
+import { classifyRedRun, isTestFile, newSourceFiles, pickTestFiles, runRedCheck } from '../src/redgreen.ts';
 import type { RunState } from '../src/store.ts';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'orcatech-test-'));
@@ -188,4 +190,128 @@ test('RunState acepta el resultado de la prueba red→green por tarea', () => {
   };
   assert.equal(tasks.T1.proof?.status, 'proven');
   assert.equal(tasks.T2.proof, undefined);
+});
+
+// ---- Integración con un repo git temporal real ----
+
+const sh = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+
+function gitRepo(): string {
+  const repo = tmp();
+  sh(repo, 'init', '-q');
+  sh(repo, 'config', 'user.email', 'test@orcatech.dev');
+  sh(repo, 'config', 'user.name', 'orcatech test');
+  sh(repo, 'config', 'commit.gpgsign', 'false');
+  return repo;
+}
+
+function put(repo: string, files: Record<string, string>) {
+  for (const [path, content] of Object.entries(files)) {
+    mkdirSync(dirname(join(repo, path)), { recursive: true });
+    writeFileSync(join(repo, path), content);
+  }
+}
+
+function commit(repo: string, msg: string): string {
+  sh(repo, 'add', '-A');
+  sh(repo, 'commit', '-q', '-m', msg);
+  return sh(repo, 'rev-parse', 'HEAD');
+}
+
+const worktrees = (repo: string) => sh(repo, 'worktree', 'list').split('\n').filter(Boolean);
+const redDirs = () => new Set(readdirSync(tmpdir()).filter((n) => n.startsWith('orcatech-red-')));
+
+const SUM_BUG = 'module.exports = (a, b) => a - b;\n';
+const SUM_OK = 'module.exports = (a, b) => a + b;\n';
+const SUM_TEST = [
+  "const { test } = require('node:test');",
+  "const assert = require('node:assert');",
+  "const sum = require('../src/sum.js');",
+  "test('sum', () => assert.strictEqual(sum(2, 3), 5));",
+  '',
+].join('\n');
+
+/** Corre runRedCheck y verifica que no quede worktree ni tmpdir. */
+async function redCheck(repo: string, pre: string, post: string, testCommand: string) {
+  const before = redDirs();
+  const proof = await runRedCheck({ repo, preCommit: pre, postCommit: post, testCommand, timeoutMs: 60_000 });
+  assert.equal(worktrees(repo).length, 1, 'solo debe quedar el worktree principal');
+  const leaked = [...redDirs()].filter((d) => !before.has(d));
+  assert.deepEqual(leaked, [], 'el tmpdir debe borrarse');
+  return proof;
+}
+
+test('changedFiles, diffRange, showFile y headCommit sobre un repo temporal', async () => {
+  const repo = gitRepo();
+  put(repo, { 'a.txt': 'uno\n', 'b.txt': 'dos\n', 'c.txt': 'contenido largo que se renombra sin cambios\n' });
+  const c1 = commit(repo, 'c1');
+  put(repo, { 'a.txt': 'uno modificado\n', 'nuevo.txt': 'nuevo\n' });
+  rmSync(join(repo, 'b.txt'));
+  renameSync(join(repo, 'c.txt'), join(repo, 'd.txt'));
+  const c2 = commit(repo, 'c2');
+
+  assert.equal(await headCommit(repo), c2);
+  assert.match(c2, /^[0-9a-f]{40}$/);
+
+  const changes = await changedFiles(repo, c1, c2);
+  const byPath = Object.fromEntries(changes.map((c) => [c.path, c.status]));
+  assert.deepEqual(byPath, { 'a.txt': 'M', 'b.txt': 'D', 'd.txt': 'R', 'nuevo.txt': 'A' });
+
+  const diff = await diffRange(repo, c1, c2);
+  assert.match(diff, /uno modificado/);
+  assert.match(await diffRange(repo, c1, c2, 10), /diff recortado/);
+
+  assert.equal(await showFile(repo, c1, 'a.txt'), 'uno\n');
+  assert.equal(await showFile(repo, c2, 'a.txt'), 'uno modificado\n');
+});
+
+test('runRedCheck: el test que corrige un bug falla en el commit previo → proven', async () => {
+  const repo = gitRepo();
+  put(repo, { 'src/sum.js': SUM_BUG });
+  const pre = commit(repo, 'sum con bug');
+  put(repo, { 'src/sum.js': SUM_OK, 'test/sum.test.js': SUM_TEST });
+  const post = commit(repo, 'corrige sum y agrega test');
+
+  const proof = await redCheck(repo, pre, post, 'node --test test/*.test.js');
+  assert.equal(proof.status, 'proven', proof.detail);
+  assert.deepEqual(proof.testFiles, ['test/sum.test.js']);
+  // El repo principal no se tocó.
+  assert.equal(readFileSync(join(repo, 'src/sum.js'), 'utf8'), SUM_OK);
+});
+
+test('runRedCheck: un test que ya pasaba antes → not-red; sin tests → no-tests', async () => {
+  const repo = gitRepo();
+  put(repo, { 'src/sum.js': SUM_OK });
+  const pre = commit(repo, 'sum correcto');
+  put(repo, { 'test/sum.test.js': SUM_TEST, 'README.md': 'docs\n' });
+  const post = commit(repo, 'solo agrega test');
+  const proof = await redCheck(repo, pre, post, 'node --test test/*.test.js');
+  assert.equal(proof.status, 'not-red', proof.detail);
+
+  put(repo, { 'src/otro.js': 'module.exports = 1;\n' });
+  const post2 = commit(repo, 'sin tests');
+  const none = await redCheck(repo, post, post2, 'node --test test/*.test.js');
+  assert.equal(none.status, 'no-tests');
+  assert.deepEqual(none.testFiles, []);
+});
+
+test('runRedCheck limpia el worktree aunque el comando falle o el commit no exista', async () => {
+  const repo = gitRepo();
+  put(repo, { 'src/sum.js': SUM_BUG });
+  const pre = commit(repo, 'c1');
+  put(repo, { 'test/sum.test.js': SUM_TEST });
+  const post = commit(repo, 'c2');
+
+  // El comando anota su cwd (el worktree) y falla con un comando inexistente.
+  const marker = join(tmp(), 'cwd.txt');
+  const failed = await redCheck(repo, pre, post, `pwd > '${marker}'; comando-que-no-existe-xyz`);
+  assert.notEqual(failed.status, 'no-tests');
+  const wt = readFileSync(marker, 'utf8').trim();
+  assert.match(wt, /orcatech-red-/);
+  assert.equal(existsSync(wt), false);
+
+  // Commit previo inválido: worktree add falla → inconclusive, sin lanzar.
+  const bad = await redCheck(repo, '0'.repeat(40), post, 'true');
+  assert.equal(bad.status, 'inconclusive');
+  assert.ok(bad.detail.length > 0);
 });
