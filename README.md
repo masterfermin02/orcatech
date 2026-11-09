@@ -14,13 +14,25 @@ idea ─► planner ─► [your approval] ─► for each task: coder ─► te
 ## Installation
 
 ```bash
-git clone https://github.com/masterfermin02/orcatech.git
-cd orcatech && npm install
-npm link            # makes the `orcatech` command available system-wide
+curl -fsSL https://raw.githubusercontent.com/masterfermin02/orcatech/main/install.sh | sh
 orcatech accounts   # checks accounts and CLIs
 ```
 
-Requirements: Node 22+, a logged-in Claude Code session (`~/.claude` and/or `~/.claude-work`), `codex` installed and logged in.
+The installer puts the source in `~/.local/share/orcatech` and links the `orcatech` command into `~/.local/bin`
+(no sudo). Run it again to update. Override the locations with `ORCATECH_DIR` / `ORCATECH_BIN_DIR`, or pin a
+version with `ORCATECH_REF=<tag>`. To uninstall: `rm -rf ~/.local/share/orcatech ~/.local/bin/orcatech`.
+
+<details>
+<summary>Manual install</summary>
+
+```bash
+git clone https://github.com/masterfermin02/orcatech.git
+cd orcatech && npm install
+npm link            # makes the `orcatech` command available system-wide
+```
+</details>
+
+Requirements: Node 22+, git, a logged-in Claude Code session (`~/.claude` and/or `~/.claude-work`), `codex` installed and logged in.
 Gemini is optional: `npm i -g @google/gemini-cli`.
 
 ## Usage
