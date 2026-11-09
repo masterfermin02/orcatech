@@ -1,65 +1,66 @@
 # orcatech
 
-Orquestador autónomo de agentes de programación. Le das una idea; un agente **planifica**, tú **apruebas** (una sola vez) y después
-otros agentes **programan, testean, reparan y revisan** solos hasta entregarte una rama git lista para revisar.
+Autonomous orchestrator for coding agents. You give it an idea; one agent **plans**, you **approve** (just once), and then
+other agents **code, test, fix and review** on their own until they hand you a git branch ready for review.
 
-Cada rol puede ser un agente distinto — **Claude** (cuenta personal o work), **Codex** o **Gemini** — y lo eliges tú:
-en la config, por corrida (CLI o dashboard) o incluso por tarea antes de aprobar el plan.
+Each role can be a different agent — **Claude** (personal or work account), **Codex** or **Gemini** — and you choose which:
+in the config, per run (CLI or dashboard), or even per task before approving the plan.
 
 ```
-idea ─► planner ─► [tu aprobación] ─► por cada tarea: coder ─► tests ─► fixer (hasta N veces) ─► commit
-                                       ─► tester (aceptación) ─► reviewer ─► fixer (si hay hallazgos graves) ─► reporte
+idea ─► planner ─► [your approval] ─► for each task: coder ─► tests ─► fixer (up to N times) ─► commit
+                                       ─► tester (acceptance) ─► reviewer ─► fixer (if serious findings) ─► report
 ```
 
-## Instalación
+## Installation
 
 ```bash
-cd ~/orcatech && npm install
-npm link            # deja el comando `orcatech` disponible en todo el sistema
-orcatech accounts   # comprueba cuentas y CLIs
+git clone https://github.com/masterfermin02/orcatech.git
+cd orcatech && npm install
+npm link            # makes the `orcatech` command available system-wide
+orcatech accounts   # checks accounts and CLIs
 ```
 
-Requisitos: Node 22+, sesión iniciada en Claude Code (`~/.claude` y/o `~/.claude-work`), `codex` instalado y logueado.
-Gemini es opcional: `npm i -g @google/gemini-cli`.
+Requirements: Node 22+, a logged-in Claude Code session (`~/.claude` and/or `~/.claude-work`), `codex` installed and logged in.
+Gemini is optional: `npm i -g @google/gemini-cli`.
 
-## Uso
+## Usage
 
 ```bash
-# En el repo del proyecto (debe estar limpio: sin cambios sin commit)
-cd ~/freefire
-orcatech run "agregar modo espectador con cámara libre"
+# Inside the project repo (must be clean: no uncommitted changes)
+cd ~/my-project
+orcatech run "add a spectator mode with a free camera"
 
-# Elegir agentes por rol (cuenta[:modelo])
-orcatech run "endpoint para exportar tasaciones a PDF" \
+# Choose agents per role (account[:model])
+orcatech run "endpoint to export appraisals to PDF" \
   --planner claude-work --coder codex --reviewer claude-work:claude-sonnet-5-5
 
-# Todo con una misma cuenta, totalmente autónomo (sin pausa de aprobación)
-orcatech run "arreglar el lag del minimapa" --all claude-personal -y
+# Everything on one account, fully autonomous (no approval pause)
+orcatech run "fix the minimap lag" --all claude-personal -y
 
-orcatech dashboard        # solo el dashboard web en http://127.0.0.1:4317
-orcatech runs             # historial
-orcatech show <id>        # reporte de una corrida
+orcatech dashboard        # only the web dashboard at http://127.0.0.1:4317
+orcatech runs             # history
+orcatech show <id>        # report for a run
 ```
 
-`orcatech run` también levanta el dashboard. El plan se puede aprobar en la terminal (`s`/`n`) o en el dashboard,
-donde además puedes **cambiar el agente de cada tarea** o quitar tareas antes de aprobar.
+`orcatech run` also starts the dashboard. The plan can be approved in the terminal (`s`/`n`) or in the dashboard,
+where you can also **change the agent for each task** or remove tasks before approving.
 
-## Cuentas, roles y routing
+## Accounts, roles and routing
 
-Una **cuenta** es un backend (`claude` | `codex` | `gemini`) con su propio entorno. Por defecto existen:
+An **account** is a backend (`claude` | `codex` | `gemini`) with its own environment. These exist by default:
 
-| Cuenta            | Backend | Cómo se separa                                 |
-| ----------------- | ------- | ---------------------------------------------- |
-| `claude-personal` | claude  | quita `CLAUDE_CONFIG_DIR` → usa `~/.claude`    |
-| `claude-work`     | claude  | `CLAUDE_CONFIG_DIR=~/.claude-work`             |
-| `codex`           | codex   | `~/.codex` (para otra cuenta usa `CODEX_HOME`) |
-| `gemini`          | gemini  | `GEMINI_API_KEY` o el login de la CLI          |
+| Account           | Backend | How it is isolated                                |
+| ----------------- | ------- | ------------------------------------------------- |
+| `claude-personal` | claude  | removes `CLAUDE_CONFIG_DIR` → uses `~/.claude`    |
+| `claude-work`     | claude  | `CLAUDE_CONFIG_DIR=~/.claude-work`                |
+| `codex`           | codex   | `~/.codex` (for another account use `CODEX_HOME`) |
+| `gemini`          | gemini  | `GEMINI_API_KEY` or the CLI login                 |
 
-Los **roles** son `planner`, `coder`, `tester`, `fixer` y `reviewer`. La configuración se mezcla en este orden (gana el último):
-defaults → `~/.orcatech/config.json` → `<repo>/orcatech.config.json` → flags de la corrida → elección por tarea en el dashboard.
+The **roles** are `planner`, `coder`, `tester`, `fixer` and `reviewer`. Configuration is merged in this order (last one wins):
+defaults → `~/.orcatech/config.json` → `<repo>/orcatech.config.json` → run flags → per-task choice in the dashboard.
 
 ```jsonc
-// orcatech.config.json  (orcatech init lo crea)
+// orcatech.config.json  (created by `orcatech init`)
 {
   "accounts": {
     "codex-work": { "backend": "codex", "env": { "CODEX_HOME": "~/.codex-work" } }
@@ -69,41 +70,41 @@ defaults → `~/.orcatech/config.json` → `<repo>/orcatech.config.json` → fla
     "coder":    { "account": "codex" },
     "reviewer": { "account": "claude-personal", "model": "claude-sonnet-5-5" }
   },
-  // el planner etiqueta cada tarea con un tipo; aquí decides quién la programa
+  // the planner tags each task with a type; here you decide who codes it
   "routing": { "game-render": "claude-personal", "backend": "codex", "frontend": "claude-work" },
   "maxFixAttempts": 3,
   "maxRunBudgetUsd": 25,
-  "testCommand": "vendor/bin/pest"   // opcional; si no, se detecta
+  "testCommand": "vendor/bin/pest"   // optional; auto-detected otherwise
 }
 ```
 
-Prioridad para programar una tarea: **elección en el dashboard > routing por tipo > rol `coder`**.
+Priority for choosing who codes a task: **dashboard choice > routing by type > `coder` role**.
 
-## Tipos de proyecto
+## Project types
 
-Se detectan solos y ajustan las instrucciones y el comando de tests:
+Detected automatically; they adjust the instructions and the test command:
 
-- **Laravel + Inertia** (`artisan` + `composer.json`) → `vendor/bin/pest` o `php artisan test`
-- **Juegos de navegador** (deps como phaser/three o README que habla de juego, `<canvas>`) → `npm test` + Playwright si existe
+- **Laravel + Inertia** (`artisan` + `composer.json`) → `vendor/bin/pest` or `php artisan test`
+- **Browser games** (deps like phaser/three, or a README that talks about a game, `<canvas>`) → `npm test` + Playwright if present
 - **Node / TS** → `npm run typecheck && npm test` · **Python** → `pytest`
 
-## Seguridad
+## Safety
 
-- Trabaja en una rama `orcatech/<id>` con un commit por tarea; **nunca hace push ni deploy** (bloqueado en Claude; Codex corre en `workspace-write`).
-- Planner y reviewer son de solo lectura. Exige un repo limpio antes de empezar.
-- El dashboard solo escucha en `127.0.0.1` y exige la cabecera `x-orcatech` en los POST.
-- `maxRunBudgetUsd` corta la corrida si el gasto estimado de Claude lo supera (Codex y Gemini solo reportan tokens).
+- Works on an `orcatech/<id>` branch with one commit per task; **never pushes or deploys** (blocked for Claude; Codex runs in `workspace-write`).
+- Planner and reviewer are read-only. A clean repo is required before starting.
+- The dashboard only listens on `127.0.0.1` and requires the `x-orcatech` header on POST requests.
+- `maxRunBudgetUsd` stops the run if Claude's estimated spend exceeds it (Codex and Gemini only report tokens).
 
-## Dónde queda todo
+## Where everything is stored
 
-`~/.orcatech/runs/<id>/` → `state.json`, `events.jsonl` (log en vivo), `plan.json`, `report.md`.
+`~/.orcatech/runs/<id>/` → `state.json`, `events.jsonl` (live log), `plan.json`, `report.md`.
 
-## Desarrollo
+## Development
 
 ```bash
 npm run typecheck && npm test
 ```
 
-## Licencia
+## License
 
-MIT — ver [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
