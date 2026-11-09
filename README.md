@@ -7,9 +7,15 @@ Each role can be a different agent — **Claude** (personal or work account), **
 in the config, per run (CLI or dashboard), or even per task before approving the plan.
 
 ```
-idea ─► planner ─► [your approval] ─► for each task: coder ─► tests ─► fixer (up to N times) ─► commit
-                                       ─► tester (acceptance) ─► reviewer ─► fixer (if serious findings) ─► report
+idea ─► planner ─► [your approval] ─► for each task:
+          coder ─► tests ─► fixer (up to N times) ─► commit
+            ─► red→green proof ─► fixer (strengthen tests, if not-red)
+            ─► per-task review ─► fixer (if high findings) ─► tests ─► commit
+        ─► tester (acceptance) ─► reviewer (whole branch) ─► fixer (if serious findings) ─► report
 ```
+
+Every fixer call within a task shares the same `maxFixAttempts` budget, and the fixer can climb a
+[ladder of agents](#per-task-review-and-fixer-ladder) as attempts go up.
 
 ## Installation
 
@@ -86,11 +92,69 @@ defaults → `~/.orcatech/config.json` → `<repo>/orcatech.config.json` → run
   "routing": { "game-render": "claude-personal", "backend": "codex", "frontend": "claude-work" },
   "maxFixAttempts": 3,
   "maxRunBudgetUsd": 25,
-  "testCommand": "vendor/bin/pest"   // optional; auto-detected otherwise
+  "testCommand": "vendor/bin/pest",  // optional; auto-detected otherwise
+  "redGreen": true,                  // default true: prove each task's new tests fail without the change
+  "reviewEachTask": true,            // default true: review each task's own diff and fix high findings
+  "fixerLadder": ["claude-personal:claude-sonnet-5-5", "codex", "claude-work:claude-opus-5-5"]  // optional
 }
 ```
 
 Priority for choosing who codes a task: **dashboard choice > routing by type > `coder` role**.
+
+## Red→green proof
+
+A test that passes both with and without a change proves nothing. So after a task passes its tests and is committed,
+orcatech checks that the task's tests actually **fail on the code from before the task** (`redGreen`, `true` by default):
+
+1. It takes only the test files the task **added or changed** (`git diff <pre>..<post>`; deleted tests are ignored).
+   Test files are recognized by path: `test/`, `tests/`, `__tests__/`, `spec/`, `*.test.*`, `*.spec.*`, `test_*.py`,
+   `*_test.py`, `*_test.go`, `*Test.php`.
+2. It creates a **temporary git worktree** at the commit before the task and copies in the post-task version of those tests.
+3. Dependency folders from your repo (`node_modules`, `vendor`, `.venv`, `venv`) are **symlinked** into the worktree,
+   so the tests don't fail just because dependencies aren't installed there.
+4. It runs the plan's test command in the worktree and expects it to fail.
+5. The worktree, the symlinks and the temporary directory are **always removed**, even if something goes wrong.
+
+Each task ends up with one of these proof states (shown in the report and the dashboard):
+
+| State          | Meaning                                                                                                    |
+| -------------- | ---------------------------------------------------------------------------------------------------------- |
+| `proven`       | The new/changed tests fail on the previous code and pass with the task: they prove the change.              |
+| `not-red`      | The tests also pass on the previous code, so they don't prove the change.                                   |
+| `inconclusive` | The run failed for another reason: a load, import or compile error (e.g. the test imports a module the task created), a timeout, or a worktree error. |
+| `no-tests`     | The task didn't add or change any test file (or produced no changes at all).                               |
+| `skipped`      | The proof didn't run: `redGreen` is `false`, there is no git, no test command, or the task failed its tests. |
+
+When the result is `not-red`, the fixer gets **one chance to strengthen the tests** so they fail without the change.
+That attempt **counts toward `maxFixAttempts`** (if none are left, the task stays `not-red`). After strengthening,
+the tests are run again and committed, and the proof is repeated against the same previous commit; if the stronger
+tests no longer pass with the task, the task is marked `failed`. A `not-red` or `inconclusive` proof never fails a task
+on its own — it's a signal for you when reviewing the branch.
+
+## Per-task review and fixer ladder
+
+**`reviewEachTask`** (`true` by default) runs the `reviewer` on **each task's own diff** (from the commit before the task
+to the task's last commit) right after the red→green proof, using the same structured review format as the final review.
+If there are **high** severity findings, they go to the fixer, then the tests are run again and the result is committed;
+if the tests fail, the fixer retries with their output. All of this uses the attempts left in `maxFixAttempts` (shared
+with test repairs and the red→green strengthening), and a task whose tests still fail is marked `failed`. There is a
+single review pass per task (no re-review) to keep cost bounded. The **final whole-branch review** still runs at the end.
+Set `reviewEachTask: false` to keep only the final review.
+
+**`fixerLadder`** (optional) is a list of `account[:model]` specs that lets the fixer escalate. Attempt **N** of a task uses
+`fixerLadder[min(N-1, len-1)]`, applied on top of the `fixer` role (the last rung is reused once you run out of rungs).
+Without a ladder, every attempt uses the `fixer` role as configured. The final review fix uses the first rung. Every
+account in the ladder must exist in `accounts`.
+
+```jsonc
+{
+  "maxFixAttempts": 4,
+  "fixerLadder": ["claude-personal:claude-sonnet-5-5", "codex", "claude-work:claude-opus-5-5"]
+}
+```
+
+With this config, a task's 1st fix attempt uses Sonnet on `claude-personal`, the 2nd uses `codex`, and the 3rd and 4th
+use Opus on `claude-work`. Each fixer step's title shows the rung it used, e.g. `(codex)`.
 
 ## Project types
 
@@ -116,6 +180,11 @@ Detected automatically; they adjust the instructions and the test command:
 ```bash
 npm run typecheck && npm test
 ```
+
+## Credits
+
+The red→green proof and the per-task review with a fixer ladder:
+Inspired by code-forge (https://github.com/ricardov03/code-forge, MIT).
 
 ## License
 
