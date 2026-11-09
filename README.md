@@ -103,3 +103,7 @@ Se detectan solos y ajustan las instrucciones y el comando de tests:
 ```bash
 npm run typecheck && npm test
 ```
+
+## Licencia
+
+MIT — ver [LICENSE](LICENSE).
