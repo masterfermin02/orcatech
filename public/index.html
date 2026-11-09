@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>orcatech</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #16181d; --muted: #6b7280; --line: #e5e7eb;
+    --accent: #2f6fed; --ok: #15803d; --bad: #b91c1c; --warn: #b45309; --chip: #eef2ff;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1115; --panel: #171a21; --ink: #e6e8ec; --muted: #9aa1ad; --line: #2a2f3a;
+      --accent: #6b9bff; --ok: #4ade80; --bad: #f87171; --warn: #fbbf24; --chip: #1f2533; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
+  header .muted { font-size: 12px; }
+  main { display: grid; grid-template-columns: 340px 1fr; gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  h3 { font-size: 14px; margin: 16px 0 8px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+  textarea, input, select { width: 100%; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 7px 8px; }
+  textarea { min-height: 90px; resize: vertical; }
+  .roles { display: grid; grid-template-columns: 72px 1fr 1fr; gap: 6px; align-items: center; }
+  .roles span { font-size: 12px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--bad); }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .muted { color: var(--muted); }
+  .runs { list-style: none; margin: 14px 0 0; padding: 0; border-top: 1px solid var(--line); }
+  .runs li { padding: 9px 4px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .runs li.sel { background: var(--chip); }
+  .runs .idea { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chip { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--chip); color: var(--ink); }
+  .st-done { color: var(--ok); } .st-failed, .st-cancelled, .st-rejected { color: var(--bad); } .st-awaiting_approval { color: var(--warn); }
+  .stats { display: flex; gap: 18px; flex-wrap: wrap; margin: 6px 0 4px; }
+  .stats div b { display: block; font-size: 18px; }
+  .task { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin: 8px 0; }
+  .task .head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .task ul { margin: 6px 0 0 18px; padding: 0; color: var(--muted); }
+  .task select { width: auto; padding: 3px 6px; }
+  .log { font: 12px/1.5 var(--mono); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; max-height: 460px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+  .log .e-error { color: var(--bad); } .log .e-status { color: var(--warn); font-weight: 600; } .log .e-step { color: var(--ok); } .log .tool { color: var(--muted); }
+  .log .who { color: var(--accent); }
+  .empty { color: var(--muted); padding: 30px 0; text-align: center; }
+  .crit { margin: 2px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐋 orcatech</h1>
+  <span class="muted">Claude · Codex · Gemini — plan → código → tests → revisión</span>
+  <span id="conn" class="muted" style="margin-left:auto">●</span>
+</header>
+<main>
+  <section>
+    <h2>Nueva corrida</h2>
+    <form id="new">
+      <label for="idea">Idea o requerimiento</label>
+      <textarea id="idea" required placeholder="Ej: agregar un modo espectador al battle royale con cámara libre"></textarea>
+      <label for="repo">Repo destino</label>
+      <input id="repo">
+      <label>Agentes por rol (cuenta · modelo opcional)</label>
+      <div class="roles" id="roles"></div>
+      <label class="row" style="color:var(--ink)"><input type="checkbox" id="auto" style="width:auto"> Aprobar el plan automáticamente</label>
+      <div class="row" style="margin-top:10px"><button class="primary" type="submit">Lanzar</button><span id="formMsg" class="muted"></span></div>
+    </form>
+    <ul class="runs" id="runs"></ul>
+  </section>
+  <section id="detail"><div class="empty">Elige o lanza una corrida.</div></section>
+</main>
+<script>
+const ROLES = ['planner', 'coder', 'tester', 'fixer', 'reviewer'];
+const ROLE_ES = { planner: 'Planifica', coder: 'Programa', tester: 'Testea', fixer: 'Repara', reviewer: 'Revisa' };
+let config = null, runs = [], selected = null, detail = null, draftPlan = null;
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const api = (path, opts = {}) => fetch(path, { ...opts, headers: { 'content-type': 'application/json', 'x-orcatech': '1', ...(opts.headers || {}) } }).then(async (r) => {
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+});
+const accountOptions = (sel) => config.accounts.map((a) => `<option value="${esc(a.name)}" ${a.name === sel ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
+
+async function loadConfig() {
+  config = await api('/api/config');
+  $('#repo').value ||= config.defaultRepo;
+  $('#roles').innerHTML = ROLES.map((r) => `
+    <span title="${r}">${ROLE_ES[r]}</span>
+    <select data-role="${r}">${accountOptions(config.roles[r].account)}</select>
+    <input data-model="${r}" placeholder="${esc(config.roles[r].model || 'modelo (opcional)')}">`).join('');
+}
+
+async function loadRuns() {
+  runs = await api('/api/runs');
+  renderRuns();
+}
+
+function renderRuns() {
+  $('#runs').innerHTML = runs.map((r) => `
+    <li class="${r.id === selected ? 'sel' : ''}" data-id="${r.id}">
+      <div class="row"><b class="st-${r.status}">${esc(r.status)}</b><span class="muted">${esc(r.id)}</span><span class="muted" style="margin-left:auto">US$${r.costUsd.toFixed(2)}</span></div>
+      <div class="idea">${esc(r.idea)}</div>
+      <div class="muted" style="font-size:12px">${esc(r.repo)}</div>
+    </li>`).join('') || '<li class="muted">Sin corridas todavía.</li>';
+}
+
+async function select(id) {
+  selected = id;
+  detail = await api('/api/runs/' + id);
+  draftPlan = detail.status === 'awaiting_approval' ? structuredClone(detail.plan) : null;
+  renderRuns();
+  renderDetail();
+}
+
+function renderDetail() {
+  const d = detail;
+  if (!d) return;
+  const waiting = d.status === 'awaiting_approval' && d.active;
+  const plan = waiting ? draftPlan : d.plan;
+  const tasks = (plan?.tasks || []).map((t, i) => {
+    const ts = d.tasks[t.id] || {};
+    const acct = waiting ? (t.account || ts.account) : ts.account;
+    return `<div class="task">
+      <div class="head"><b>[${esc(t.id)}] ${esc(t.title)}</b><span class="chip">${esc(t.kind)}</span>
+        ${waiting ? `<select data-task="${i}">${accountOptions(acct)}</select><button class="danger" data-drop="${i}" type="button">Quitar</button>`
+                  : `<span class="muted">${esc(acct || '')}</span><span class="st-${ts.status === 'passed' ? 'done' : ts.status === 'failed' ? 'failed' : ''}">${esc(ts.status || '')}${ts.attempts ? ` · ${ts.attempts} reparación(es)` : ''}${ts.commit ? ` · ${esc(ts.commit)}` : ''}</span>`}
+      </div>
+      <div>${esc(t.description)}</div>
+      <ul>${t.acceptance.map((a) => `<li>${esc(a)}</li>`).join('')}</ul>
+    </div>`;
+  }).join('');
+
+  const tr = d.testReport, rv = d.review;
+  $('#detail').innerHTML = `
+    <div class="row"><h2 style="margin:0">Corrida ${esc(d.id)}</h2><b class="st-${d.status}">${esc(d.status)}</b>
+      <span style="margin-left:auto" class="row">
+        ${waiting ? '<button class="primary" id="approve">Aprobar plan</button><button class="danger" id="reject">Rechazar</button>' : ''}
+        ${d.active && !waiting ? '<button class="danger" id="cancel">Cancelar</button>' : ''}
+      </span></div>
+    <p>${esc(d.idea)}</p>
+    <div class="stats">
+      <div><span class="muted">Costo Claude</span><b>US$${d.costUsd.toFixed(2)}</b></div>
+      <div><span class="muted">Tokens</span><b>${d.tokens.input.toLocaleString()} / ${d.tokens.output.toLocaleString()}</b></div>
+      <div><span class="muted">Proyecto</span><b>${esc(d.projectType)}</b></div>
+      <div><span class="muted">Rama</span><b style="font-size:13px">${esc(d.branch || '—')}</b></div>
+    </div>
+    <div class="row" style="margin:6px 0">${ROLES.map((r) => `<span class="chip">${ROLE_ES[r]}: ${esc(d.roles[r].account)}${d.roles[r].model ? ' · ' + esc(d.roles[r].model) : ''}</span>`).join('')}</div>
+    ${d.error ? `<p class="st-failed">⚠ ${esc(d.error)}</p>` : ''}
+    ${plan ? `<h3>Plan ${waiting ? '<span class="muted">— puedes cambiar el agente de cada tarea o quitar tareas antes de aprobar</span>' : ''}</h3>
+      <p>${esc(plan.summary)}</p><p class="muted">Tests: <code>${esc(plan.testCommand || '(se crearán)')}</code></p>${tasks}` : ''}
+    ${tr ? `<h3>Aceptación: <span class="${tr.passed ? 'st-done' : 'st-failed'}">${tr.passed ? 'pasa' : 'no pasa'}</span></h3><p>${esc(tr.summary)}</p>
+      ${tr.criteria.map((c) => `<div class="crit">${c.status === 'pass' ? '✅' : c.status === 'fail' ? '❌' : '➖'} ${esc(c.criterion)} <span class="muted">${esc(c.evidence)}</span></div>`).join('')}` : ''}
+    ${rv ? `<h3>Revisión: ${esc(rv.verdict)}</h3><p>${esc(rv.summary)}</p>${rv.issues.map((i) => `<div class="crit"><b>${esc(i.severity)}</b> <code>${esc(i.file)}</code> ${esc(i.description)}</div>`).join('')}` : ''}
+    <h3>Actividad en vivo</h3>
+    <div class="log" id="log">${(d.events || []).map(eventLine).join('')}</div>`;
+
+  const log = $('#log'); log.scrollTop = log.scrollHeight;
+  $('#approve')?.addEventListener('click', () => api(`/api/runs/${d.id}/approve`, { method: 'POST', body: JSON.stringify({ plan: draftPlan }) }).catch(alert));
+  $('#reject')?.addEventListener('click', () => api(`/api/runs/${d.id}/reject`, { method: 'POST' }).catch(alert));
+  $('#cancel')?.addEventListener('click', () => api(`/api/runs/${d.id}/cancel`, { method: 'POST' }).catch(alert));
+  document.querySelectorAll('[data-task]').forEach((el) => el.addEventListener('change', () => { draftPlan.tasks[+el.dataset.task].account = el.value; }));
+  document.querySelectorAll('[data-drop]').forEach((el) => el.addEventListener('click', () => { draftPlan.tasks.splice(+el.dataset.drop, 1); renderDetail(); }));
+}
+
+function eventLine(e) {
+  const tool = e.text.startsWith('🔧');
+  const who = e.role ? `<span class="who">${esc(e.role)}@${esc(e.account)}</span> ` : '';
+  return `<div class="e-${e.kind} ${tool ? 'tool' : ''}"><span class="muted">${esc(e.ts.slice(11, 19))}</span> ${who}${esc(e.text.length > 1200 ? e.text.slice(0, 1200) + '…' : e.text)}</div>`;
+}
+
+$('#new').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const roles = {};
+  for (const r of ROLES) {
+    const acct = document.querySelector(`[data-role="${r}"]`).value;
+    const model = document.querySelector(`[data-model="${r}"]`).value.trim();
+    if (acct !== config.roles[r].account || model) roles[r] = model ? `${acct}:${model}` : acct;
+  }
+  $('#formMsg').textContent = 'Lanzando…';
+  try {
+    const { id } = await api('/api/runs', { method: 'POST', body: JSON.stringify({ idea: $('#idea').value, repo: $('#repo').value, roles, autoApprove: $('#auto').checked }) });
+    $('#formMsg').textContent = '';
+    await loadRuns();
+    select(id);
+  } catch (e) { $('#formMsg').textContent = e.message; }
+});
+$('#runs').addEventListener('click', (ev) => { const li = ev.target.closest('li[data-id]'); if (li) select(li.dataset.id); });
+$('#repo').addEventListener('change', async () => { const r = $('#repo').value; config = await api('/api/config?repo=' + encodeURIComponent(r)); config.defaultRepo = r; loadConfig(); });
+
+function connect() {
+  const es = new EventSource('/api/stream');
+  es.onopen = () => { $('#conn').style.color = 'var(--ok)'; $('#conn').title = 'conectado'; };
+  es.onerror = () => { $('#conn').style.color = 'var(--bad)'; $('#conn').title = 'reconectando…'; };
+  es.addEventListener('log', (m) => {
+    const e = JSON.parse(m.data);
+    if (detail && e.runId === detail.id) {
+      detail.events = [...(detail.events || []), e].slice(-800);
+      const log = $('#log');
+      if (log) { const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40; log.insertAdjacentHTML('beforeend', eventLine(e)); if (atBottom) log.scrollTop = log.scrollHeight; }
+    }
+  });
+  es.addEventListener('state', (m) => {
+    const s = JSON.parse(m.data);
+    const i = runs.findIndex((r) => r.id === s.id);
+    if (i >= 0) runs[i] = s; else runs.unshift(s);
+    renderRuns();
+    if (detail && s.id === detail.id) {
+      const enteredApproval = s.status === 'awaiting_approval' && detail.status !== 'awaiting_approval';
+      const editing = s.status === 'awaiting_approval' && !enteredApproval && draftPlan;
+      detail = { ...s, events: detail.events };
+      if (enteredApproval) draftPlan = structuredClone(s.plan);
+      if (s.status !== 'awaiting_approval') draftPlan = null;
+      if (!editing) renderDetail();
+    }
+  });
+}
+
+loadConfig().then(loadRuns).then(() => { if (runs[0]) select(runs[0].id); });
+connect();
+</script>
+</body>
+</html>
