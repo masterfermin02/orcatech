@@ -110,8 +110,12 @@ orcatech checks that the task's tests actually **fail on the code from before th
    Test files are recognized by path: `test/`, `tests/`, `__tests__/`, `spec/`, `*.test.*`, `*.spec.*`, `test_*.py`,
    `*_test.py`, `*_test.go`, `*Test.php`.
 2. It creates a **temporary git worktree** at the commit before the task and copies in the post-task version of those tests.
+   It never writes through symlinks: a test file that was a symlink in the previous commit is replaced by a regular
+   file, and a path whose parent directory is a symlink makes the proof `inconclusive`.
 3. Dependency folders from your repo (`node_modules`, `vendor`, `.venv`, `venv`) are **symlinked** into the worktree,
-   so the tests don't fail just because dependencies aren't installed there.
+   so the tests don't fail just because dependencies aren't installed there. A Composer `vendor` is the exception:
+   `vendor/composer`, `vendor/bin` and the top-level files are **copied** (only packages are symlinked), so the
+   autoloader resolves your application classes inside the worktree, not from the main repo.
 4. It runs the plan's test command in the worktree and expects it to fail.
 5. The worktree, the symlinks and the temporary directory are **always removed**, even if something goes wrong.
 
@@ -119,9 +123,9 @@ Each task ends up with one of these proof states (shown in the report and the da
 
 | State          | Meaning                                                                                                    |
 | -------------- | ---------------------------------------------------------------------------------------------------------- |
-| `proven`       | The new/changed tests fail on the previous code and pass with the task: they prove the change.              |
+| `proven`       | The new/changed tests fail on the previous code (with a recognizable assertion/test failure) and pass with the task: they prove the change. |
 | `not-red`      | The tests also pass on the previous code, so they don't prove the change.                                   |
-| `inconclusive` | The run failed for another reason: a load, import or compile error (e.g. the test imports a module the task created), a timeout, or a worktree error. |
+| `inconclusive` | The run failed for another reason: a load, import or compile error (e.g. the test imports a module the task created), an environment error (command not found, exit 126/127, database/network connection, missing config), output with no recognizable test failure, a timeout, or a worktree error. |
 | `no-tests`     | The task didn't add or change any test file (or produced no changes at all).                               |
 | `skipped`      | The proof didn't run: `redGreen` is `false`, there is no git, no test command, or the task failed its tests. |
 

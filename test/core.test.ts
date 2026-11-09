@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -211,6 +211,46 @@ test('classifyRedRun: errores de carga o compilación son inconclusive', () => {
   }
 });
 
+test('classifyRedRun: errores de infraestructura y salidas desconocidas son inconclusive, no proven', () => {
+  const ctx = { testFiles: ['test/a.test.ts'], newFiles: [] };
+  // Comando inexistente (127) o no ejecutable (126), aunque la salida parezca un fallo.
+  assert.equal(classifyRedRun({ code: 127, output: 'sh: phpunit: command not found' }, ctx).status, 'inconclusive');
+  assert.equal(classifyRedRun({ code: 127, output: 'not ok 1 - x' }, ctx).status, 'inconclusive');
+  assert.equal(classifyRedRun({ code: 126, output: 'sh: ./run: Permission denied' }, ctx).status, 'inconclusive');
+  for (const out of [
+    'sh: 1: pytest: not found',
+    'Error: connect ECONNREFUSED 127.0.0.1:5432\nnot ok 1 - crea usuario\n# fail 1',
+    'SQLSTATE[HY000] [2002] Connection refused\nFAILURES!',
+    'psql: error: could not connect to server: No such file or directory',
+    "SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost'",
+    'getaddrinfo ENOTFOUND db',
+    'npm ERR! Missing script: "test"',
+    'Error: Missing required environment variable DATABASE_URL',
+    'No application encryption key has been specified.',
+    'Could not open input file: artisan',
+    'algo salió mal', // salida desconocida: sin señal de aserción
+    '',
+  ]) {
+    const r = classifyRedRun({ code: 1, output: out }, ctx);
+    assert.equal(r.status, 'inconclusive', out);
+  }
+  // Fallos de aserción reales de distintos runners siguen siendo proven.
+  for (const out of [
+    'AssertionError [ERR_ASSERTION]: Expected values to be strictly equal',
+    'not ok 1 - sum\n# fail 1',
+    'ℹ fail 1',
+    'Tests:       1 failed, 3 passed, 4 total',
+    '  1 failing',
+    'FAILED tests/test_api.py::test_sum - assert 1 == 2',
+    'Failed asserting that 1 is identical to 2.\nFAILURES!',
+    '--- FAIL: TestSum (0.00s)',
+    "thread 'sum' panicked at 'assertion failed: `(left == right)`'",
+    'expected 2 to equal 3',
+  ]) {
+    assert.equal(classifyRedRun({ code: 1, output: out }, ctx).status, 'proven', out);
+  }
+});
+
 test('RunState acepta el resultado de la prueba red→green por tarea', () => {
   const tasks: RunState['tasks'] = {
     T1: { status: 'passed', attempts: 1, account: 'codex', proof: { status: 'proven', detail: 'ok', testFiles: ['test/a.test.ts'] } },
@@ -372,10 +412,120 @@ test('runRedCheck limpia el worktree aunque el comando falle o el commit no exis
   assert.match(wt, /orcatech-red-/);
   assert.equal(existsSync(wt), false);
 
+  // Un comando inexistente nunca es una prueba válida.
+  assert.equal(failed.status, 'inconclusive', failed.detail);
+
   // Commit previo inválido: worktree add falla → inconclusive, sin lanzar.
   const bad = await redCheck(repo, '0'.repeat(40), post, 'true');
   assert.equal(bad.status, 'inconclusive');
   assert.ok(bad.detail.length > 0);
+});
+
+test('runRedCheck no escribe fuera del worktree a través de symlinks del commit previo', async () => {
+  const outside = tmp();
+  const victim = join(outside, 'victima.txt');
+  writeFileSync(victim, 'intacto\n');
+
+  // 1) El test modificado era un symlink a un archivo externo.
+  const repo = gitRepo();
+  put(repo, { 'src/sum.js': SUM_BUG });
+  symlinkSync(victim, join(repo, 'evil.test.js'));
+  const pre = commit(repo, 'test como symlink externo');
+  rmSync(join(repo, 'evil.test.js'));
+  symlinkSync(join(outside, 'otro.txt'), join(repo, 'evil.test.js'));
+  const post = commit(repo, 'cambia el destino del symlink');
+  const proof = await redCheck(repo, pre, post, 'true');
+  assert.notEqual(proof.status, 'no-tests');
+  assert.equal(readFileSync(victim, 'utf8'), 'intacto\n', 'el archivo externo no debe sobrescribirse');
+
+  // 2) Un directorio intermedio era un symlink a un directorio externo.
+  const repo2 = gitRepo();
+  put(repo2, { 'src/sum.js': SUM_BUG });
+  mkdirSync(join(repo2, 'test'));
+  symlinkSync(outside, join(repo2, 'test/fx'), 'dir');
+  const pre2 = commit(repo2, 'test/fx es symlink externo');
+  rmSync(join(repo2, 'test/fx'));
+  put(repo2, { 'test/fx/a.test.js': SUM_TEST });
+  const post2 = commit(repo2, 'test/fx pasa a ser directorio');
+  const proof2 = await redCheck(repo2, pre2, post2, 'node --test test/fx/*.test.js');
+  assert.equal(proof2.status, 'inconclusive', proof2.detail);
+  assert.match(proof2.detail, /enlace simbólico/);
+  assert.equal(existsSync(join(outside, 'a.test.js')), false, 'no debe crearse nada fuera del worktree');
+  assert.deepEqual(readdirSync(outside).sort(), ['victima.txt']);
+});
+
+/** Repo con un vendor/ estilo Composer cuyo autoloader resuelve el código de la app desde vendor/composer/../.. */
+function composerLikeRepo(): { repo: string; pre: string; post: string } {
+  const repo = gitRepo();
+  put(repo, {
+    '.gitignore': 'vendor/\n',
+    'src/sum.js': SUM_BUG,
+    // Igual que Composer: $baseDir = dirname(dirname(__DIR__)), y __DIR__ resuelve symlinks.
+    'vendor/autoload.cjs': "module.exports = require('./composer/autoload_real.cjs');\n",
+    'vendor/composer/autoload_real.cjs': [
+      "const path = require('node:path');",
+      'const baseDir = path.dirname(path.dirname(__dirname));',
+      "module.exports = (name) => require(path.join(baseDir, 'src', name));",
+      '',
+    ].join('\n'),
+    'vendor/acme/lib/index.cjs': 'module.exports = 42;\n',
+  });
+  const pre = commit(repo, 'sum con bug');
+  put(repo, {
+    'src/sum.js': SUM_OK,
+    'test/sum.test.js': [
+      "const { test } = require('node:test');",
+      "const assert = require('node:assert');",
+      "const load = require('../vendor/autoload.cjs');",
+      "test('sum', () => {",
+      "  assert.strictEqual(require('../vendor/acme/lib/index.cjs'), 42);",
+      "  assert.strictEqual(load('sum.js')(2, 3), 5);",
+      '});',
+      '',
+    ].join('\n'),
+  });
+  return { repo, pre, post: commit(repo, 'corrige sum') };
+}
+
+test('runRedCheck: el autoload estilo Composer resuelve el código de la app dentro del worktree', async () => {
+  const { repo, pre, post } = composerLikeRepo();
+  const proof = await redCheck(repo, pre, post, 'node --test test/*.test.js');
+  assert.equal(proof.status, 'proven', proof.detail);
+  // vendor del repo principal intacto.
+  assert.ok(existsSync(join(repo, 'vendor/composer/autoload_real.cjs')));
+  assert.ok(existsSync(join(repo, 'vendor/acme/lib/index.cjs')));
+});
+
+const hasComposer = (() => {
+  try {
+    execFileSync('php', ['--version'], { stdio: 'ignore' });
+    execFileSync('composer', ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+test('runRedCheck con Composer real: el autoloader carga el código previo del worktree', { skip: !hasComposer && 'requiere php y composer' }, async () => {
+  const repo = gitRepo();
+  const calc = (op: string) => `<?php\nnamespace App;\nclass Calc { public static function sum($a, $b) { return $a ${op} $b; } }\n`;
+  put(repo, {
+    '.gitignore': 'vendor/\n',
+    'composer.json': JSON.stringify({ name: 'orcatech/red', autoload: { 'psr-4': { 'App\\': 'src/' } } }),
+    'src/Calc.php': calc('-'),
+  });
+  const pre = commit(repo, 'calc con bug');
+  execFileSync('composer', ['dump-autoload', '--quiet', '--no-interaction'], { cwd: repo, stdio: 'ignore' });
+  assert.ok(existsSync(join(repo, 'vendor/composer/autoload_psr4.php')));
+  put(repo, {
+    'src/Calc.php': calc('+'),
+    'tests/CalcTest.php': "<?php\nrequire __DIR__ . '/../vendor/autoload.php';\nassert(\\App\\Calc::sum(2, 3) === 5);\necho \"ok\\n\";\n",
+  });
+  const post = commit(repo, 'corrige calc');
+  const cmd = 'php -d zend.assertions=1 -d assert.exception=1 tests/CalcTest.php';
+  execFileSync('sh', ['-c', cmd], { cwd: repo }); // pasa con la tarea
+  const proof = await redCheck(repo, pre, post, cmd);
+  assert.equal(proof.status, 'proven', proof.detail);
 });
 
 // ---- Integración de la prueba red→green en el loop de tareas (proveTask) ----

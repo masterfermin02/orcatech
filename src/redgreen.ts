@@ -3,10 +3,10 @@
 // La lógica pura va primero; runRedCheck (al final) hace el I/O con git y un
 // worktree temporal que se limpia siempre.
 
-import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { constants as fsConstants, existsSync } from 'node:fs';
+import { cp, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, symlink, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative, resolve, isAbsolute } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { runProcess } from './backends/proc.ts';
 import { addWorktree, changedFiles, removeWorktree, showFile } from './git.ts';
 
@@ -140,14 +140,161 @@ export function classifyRedRun(
     };
   }
 
+  if (run.code === 126 || run.code === 127 || INFRA_ERROR_PATTERNS.some((re) => re.test(output))) {
+    return {
+      status: 'inconclusive',
+      detail: `La corrida sobre el código previo falló por un error de entorno o infraestructura (código ${run.code}), no por una aserción.`,
+    };
+  }
+
+  if (ASSERTION_FAILURE_PATTERNS.some((re) => re.test(output))) {
+    return {
+      status: 'proven',
+      detail: `Los tests (${files}) fallan sobre el código previo (código ${run.code}) y pasan con la tarea.`,
+    };
+  }
+
   return {
-    status: 'proven',
-    detail: `Los tests (${files}) fallan sobre el código previo (código ${run.code}) y pasan con la tarea.`,
+    status: 'inconclusive',
+    detail: `La corrida sobre el código previo salió con código ${run.code} sin señales reconocibles de un fallo de aserción.`,
   };
 }
 
+/** Señales de que la corrida falló por el entorno (comando, red, base de datos, config), no por los tests. */
+const INFRA_ERROR_PATTERNS: RegExp[] = [
+  /command not found/i,
+  /^\S*sh: (\d+: )?[^:\n]+: not found$/m, // sh/dash: "sh: 1: pytest: not found"
+  /ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN/,
+  /Connection refused/i,
+  /getaddrinfo/i,
+  /could not connect to (the )?(server|database)/i,
+  /SQLSTATE\[(HY000|08\d{3})\]/,
+  /Access denied for user/i,
+  /database "[^"]*" does not exist/i,
+  /Unknown database/i,
+  /Missing script:/i, // npm
+  /ERR_PNPM_NO_SCRIPT/,
+  /missing (required )?(environment|env) variable/i,
+  /environment variable [^\n]* (is )?(not set|missing|required)/i,
+  /No application encryption key/i, // Laravel sin APP_KEY
+  /Could not open input file/i, // php
+  /EADDRINUSE/,
+];
+
+/** Señales positivas de que los tests se ejecutaron y fallaron (aserciones o tests en rojo). */
+const ASSERTION_FAILURE_PATTERNS: RegExp[] = [
+  /AssertionError|ERR_ASSERTION|AssertionFailedError/,
+  /^\s*not ok \d+/m, // TAP (node --test, prove)
+  /^[#ℹ] fail [1-9]/m, // resumen de node --test
+  /\b[1-9]\d* (failed|failing)\b/i, // jest/vitest/mocha/pytest
+  /^FAILED\b|^=+ FAILURES =+|FAILED \(.*(failures|errors)=/m, // pytest/unittest
+  /Failed asserting/i, // PHPUnit
+  /^FAILURES!$/m, // PHPUnit
+  /^\s*(✕|✗|×|✖)\s/m, // reporters con símbolos
+  /^--- FAIL:|^FAIL\b/m, // go test, jest
+  /assertion failed/i, // rust, C
+  /test result: FAILED/, // cargo
+  /^Failures:$/m, // rspec
+  /\bexpected\b[^\n]*\b(to|but|got|received)\b/i,
+  /Expected:?[^\n]*\n\s*(Received|Actual|but was|got)/i,
+];
+
 /** Carpetas de dependencias (normalmente ignoradas por git) que se enlazan en el worktree. */
 const DEP_DIRS = ['node_modules', 'vendor', '.venv', 'venv'];
+
+/** Dentro de un vendor de Composer, lo que se copia en vez de enlazarse (autoload y proxies de bin). */
+const COMPOSER_LOCAL = new Set(['composer', 'bin']);
+
+const isInside = (root: string, path: string) => {
+  const rel = relative(root, path);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+};
+
+const errCode = (e: unknown) => (e as NodeJS.ErrnoException | undefined)?.code;
+
+/**
+ * Escribe `content` en `root/file` sin salir de `root`: rechaza rutas con `..` y
+ * directorios intermedios que sean symlinks; si el archivo final es un symlink,
+ * lo sustituye por un archivo normal (nunca escribe a través del enlace).
+ */
+async function writeInside(root: string, file: string, content: string): Promise<void> {
+  const target = resolve(root, file);
+  if (target === root || !isInside(root, target)) throw new Error(`Ruta de test fuera del repo: ${file}`);
+  const parts = relative(root, target).split(sep);
+  let cur = root;
+  for (let i = 0; i < parts.length; i++) {
+    cur = join(cur, parts[i]);
+    let st;
+    try {
+      st = await lstat(cur);
+    } catch (e) {
+      if (errCode(e) === 'ENOENT') break; // el resto no existe: mkdir crea directorios reales
+      throw e;
+    }
+    if (!st.isSymbolicLink()) continue;
+    if (i < parts.length - 1) throw new Error(`Ruta de test con un enlace simbólico en el commit previo: ${file}`);
+    await unlink(cur);
+  }
+  await mkdir(dirname(target), { recursive: true });
+  if (!isInside(root, await realpath(dirname(target)))) throw new Error(`Ruta de test fuera del repo: ${file}`);
+  // O_NOFOLLOW: si alguien recreó el enlace entre medio, falla en vez de seguirlo.
+  const fh = await open(target, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW, 0o644);
+  try {
+    await fh.writeFile(content);
+  } finally {
+    await fh.close();
+  }
+}
+
+/**
+ * Pone a disposición del worktree las dependencias instaladas en el repo principal.
+ * Normalmente es un symlink, salvo un vendor de Composer: su autoloader calcula la
+ * raíz de la app desde vendor/composer (vía __DIR__, que resuelve symlinks), así
+ * que vendor/composer, vendor/bin y los archivos sueltos se copian, y solo se
+ * enlazan los paquetes. Los paquetes "path" que apuntan dentro del repo se
+ * enlazan a su versión en el worktree.
+ */
+async function provideDependencies(repo: string, dir: string, links: string[]): Promise<void> {
+  const repoReal = await realpath(repo);
+  const link = async (target: string, at: string) => {
+    await symlink(target, at, 'dir');
+    links.push(at);
+  };
+  for (const dep of DEP_DIRS) {
+    const src = join(repoReal, dep);
+    const dst = join(dir, dep);
+    if (!existsSync(src) || existsSync(dst)) continue;
+    if (dep !== 'vendor' || !existsSync(join(src, 'composer'))) {
+      await link(src, dst);
+      continue;
+    }
+    const srcReal = await realpath(src);
+    await mkdir(dst);
+    for (const entry of await readdir(srcReal, { withFileTypes: true })) {
+      const from = join(srcReal, entry.name);
+      const to = join(dst, entry.name);
+      if (COMPOSER_LOCAL.has(entry.name) || (!entry.isDirectory() && !entry.isSymbolicLink())) {
+        await cp(from, to, { recursive: true, verbatimSymlinks: true });
+        continue;
+      }
+      if (!entry.isDirectory()) {
+        await link(from, to);
+        continue;
+      }
+      // vendor/<namespace>/<paquete>
+      await mkdir(to);
+      for (const pkg of await readdir(from, { withFileTypes: true })) {
+        const pkgFrom = join(from, pkg.name);
+        let target = pkgFrom;
+        if (pkg.isSymbolicLink()) {
+          const real = await realpath(pkgFrom).catch(() => pkgFrom);
+          if (isInside(repoReal, real) && !isInside(srcReal, real)) target = join(dir, relative(repoReal, real));
+        }
+        await link(target, join(to, pkg.name));
+      }
+    }
+  }
+}
 
 export interface RedCheckOptions {
   repo: string;
@@ -185,22 +332,11 @@ export async function runRedCheck(opts: RedCheckOptions): Promise<TaskProof> {
 
     // Tests en su versión post-tarea sobre el código previo.
     for (const file of testFiles) {
-      const target = resolve(dir, file);
-      const rel = relative(dir, target);
-      if (rel.startsWith('..') || isAbsolute(rel)) throw new Error(`Ruta de test fuera del repo: ${file}`);
-      await mkdir(dirname(target), { recursive: true });
-      await writeFile(target, await showFile(opts.repo, opts.postCommit, file));
+      await writeInside(dir, file, await showFile(opts.repo, opts.postCommit, file));
     }
 
     // Dependencias instaladas del repo principal, para no fallar solo por faltar.
-    for (const dep of DEP_DIRS) {
-      const src = join(opts.repo, dep);
-      const dst = join(dir, dep);
-      if (existsSync(src) && !existsSync(dst)) {
-        await symlink(resolve(src), dst, 'dir');
-        links.push(dst);
-      }
-    }
+    await provideDependencies(opts.repo, dir, links);
 
     const r = await runProcess('/bin/sh', ['-c', opts.testCommand], {
       cwd: dir,
