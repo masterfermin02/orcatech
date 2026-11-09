@@ -3,6 +3,9 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renam
 import { join } from 'node:path';
 import { GLOBAL_DIR, type RoleConfig, type Role } from './config.ts';
 import type { Plan, Review, TestReport } from './prompts.ts';
+import type { ProofStatus, TaskProof } from './redgreen.ts';
+
+export type { ProofStatus, TaskProof };
 
 export const RUNS_DIR = join(GLOBAL_DIR, 'runs');
 
@@ -33,6 +36,15 @@ export interface StepRecord {
   error?: string;
 }
 
+export interface TaskRecord {
+  status: TaskStatus;
+  attempts: number;
+  account: string;
+  commit?: string;
+  /** Resultado de la prueba red→green de la tarea (ausente en corridas antiguas). */
+  proof?: TaskProof;
+}
+
 export interface RunState {
   id: string;
   idea: string;
@@ -45,7 +57,7 @@ export interface RunState {
   branch?: string;
   baseRef?: string;
   plan?: Plan;
-  tasks: Record<string, { status: TaskStatus; attempts: number; account: string; commit?: string }>;
+  tasks: Record<string, TaskRecord>;
   steps: StepRecord[];
   costUsd: number;
   tokens: { input: number; output: number };
