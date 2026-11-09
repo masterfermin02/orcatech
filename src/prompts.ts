@@ -154,6 +154,28 @@ export function testerPrompt(plan: Plan, info: ProjectInfo): string {
   return `Objetivo: ${plan.summary}\n\nCriterios de aceptación a verificar:\n${criteria}\n\nComando de tests: ${plan.testCommand || '(detéctalo)'}\n\n${projectContext(info)}\n\nDevuelve el reporte en el formato JSON pedido.`;
 }
 
+/** Revisión acotada a una sola tarea: su propio diff contra sus criterios de aceptación. */
+export function taskReviewPrompt(plan: Plan, task: PlanTask, diff: string): string {
+  return `Objetivo general: ${plan.summary}
+
+Revisa SOLO esta tarea: [${task.id}] ${task.title} (tipo: ${task.kind})
+${task.description}
+
+Criterios de aceptación:
+${task.acceptance.map((a) => `- ${a}`).join('\n') || '- (sin criterios explícitos)'}
+
+Diff de la tarea (recortado):
+
+\`\`\`diff
+${diff}
+\`\`\`
+
+Verifica que el diff cumpla los criterios de aceptación de esta tarea y busca bugs, casos borde, problemas de seguridad y tests faltantes
+introducidos por este diff. No reportes trabajo que corresponde a otras tareas del plan.
+Usa severidad high solo para bugs reales, fallos de seguridad o criterios de aceptación incumplidos.
+Puedes leer los archivos completos del repo si necesitas contexto. Devuelve la revisión en el formato JSON pedido.`;
+}
+
 export function reviewPrompt(plan: Plan, diff: string): string {
   return `Objetivo: ${plan.summary}\n\nTareas:\n${plan.tasks.map((t) => `- [${t.id}] ${t.title}`).join('\n')}\n\nDiff a revisar (recortado):\n\n\`\`\`diff\n${diff}\n\`\`\`\n\nPuedes leer los archivos completos del repo si necesitas contexto. Devuelve la revisión en el formato JSON pedido.`;
 }

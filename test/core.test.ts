@@ -7,8 +7,8 @@ import { execFileSync } from 'node:child_process';
 import { accountEnv, extractJson } from '../src/backends/types.ts';
 import { DEFAULT_CONFIG, ladderSpec, loadConfig, roleOverride } from '../src/config.ts';
 import { detectProject } from '../src/detect.ts';
-import { proveTask, proofLogText, resolveFixerRole, type ProofDeps, type ProofInput } from '../src/pipeline.ts';
-import { PLAN_SCHEMA, REVIEW_SCHEMA, TEST_SCHEMA, strengthenTestsPrompt } from '../src/prompts.ts';
+import { highIssues, proveTask, proofLogText, resolveFixerRole, reviewTask, type ProofDeps, type ProofInput, type TaskReviewDeps, type TaskReviewInput } from '../src/pipeline.ts';
+import { PLAN_SCHEMA, REVIEW_SCHEMA, TEST_SCHEMA, fixPrompt, strengthenTestsPrompt, taskReviewPrompt, type Plan, type Review } from '../src/prompts.ts';
 import { changedFiles, diffRange, headCommit, showFile } from '../src/git.ts';
 import { classifyRedRun, isTestFile, newSourceFiles, pickTestFiles, runRedCheck } from '../src/redgreen.ts';
 import type { RunState, TaskProof, TaskRecord } from '../src/store.ts';
@@ -509,4 +509,154 @@ test('proveTask con git real: la tarea cuyo test falla en el commit previo queda
   assert.deepEqual(proof.testFiles, ['test/sum.test.js']);
   assert.equal(calls.fix.length, 0);
   assert.equal(worktrees(repo).length, 1);
+});
+
+// ---- Revisión por tarea (reviewTask) ----
+
+const REVIEW_MIXED: Review = {
+  verdict: 'changes',
+  summary: 'hay problemas',
+  issues: [
+    { severity: 'high', file: 'src/a.ts', description: 'división por cero' },
+    { severity: 'medium', file: 'src/b.ts', description: 'nombre confuso' },
+    { severity: 'low', file: 'src/c.ts', description: 'typo' },
+    { severity: 'high', file: 'src/d.ts', description: 'inyección SQL' },
+  ],
+};
+
+test('highIssues filtra solo severity high y devuelve [] con undefined', () => {
+  assert.deepEqual(highIssues(undefined), []);
+  assert.deepEqual(highIssues(), []);
+  assert.deepEqual(highIssues({ verdict: 'approve', summary: '', issues: [] }), []);
+  assert.deepEqual(highIssues(REVIEW_MIXED).map((i) => i.file), ['src/a.ts', 'src/d.ts']);
+  assert.deepEqual(highIssues({ ...REVIEW_MIXED, issues: REVIEW_MIXED.issues.filter((i) => i.severity !== 'high') }), []);
+});
+
+test('taskReviewPrompt está en español, acota a la tarea e incluye criterios y diff', () => {
+  const plan: Plan = {
+    summary: 'Calculadora',
+    testCommand: 'npm test',
+    risks: [],
+    tasks: [
+      { id: 'T1', title: 'Sumar', kind: 'backend', description: 'Implementa sum', acceptance: ['sum(1,2) es 3'], files: [] },
+      { id: 'T2', title: 'Restar', kind: 'backend', description: 'Implementa sub', acceptance: ['sub(3,1) es 2'], files: [] },
+    ],
+  };
+  const p = taskReviewPrompt(plan, plan.tasks[0], 'diff --git a/src/sum.js');
+  assert.match(p, /Revisa SOLO esta tarea: \[T1\] Sumar/);
+  assert.match(p, /- sum\(1,2\) es 3/);
+  assert.match(p, /diff --git a\/src\/sum\.js/);
+  assert.match(p, /criterios de aceptación/i);
+  assert.doesNotMatch(p, /sub\(3,1\)/);
+});
+
+function fakeReviewDeps(review: Review | undefined, over: Partial<TaskReviewDeps> = {}) {
+  const calls = { diff: 0, review: [] as string[], fix: [] as { attempt: number; prompt: string }[], commits: [] as string[], tests: 0, saves: 0, logs: [] as string[] };
+  const deps: TaskReviewDeps = {
+    diff: async () => (calls.diff++, 'el diff'),
+    review: async (d) => (calls.review.push(d), review),
+    fix: async (attempt, prompt) => void calls.fix.push({ attempt, prompt }),
+    runTests: async () => (calls.tests++, { ok: true, output: '' }),
+    commit: async (m) => (calls.commits.push(m), 'fix1234'),
+    status: () => undefined,
+    log: (t) => void calls.logs.push(t),
+    save: () => void calls.saves++,
+    ...over,
+  };
+  return { deps, calls };
+}
+
+function reviewInput(record: Partial<TaskRecord> = {}, over: Partial<TaskReviewInput> = {}): TaskReviewInput {
+  return {
+    taskId: 'T1',
+    record: { status: 'passed', attempts: 0, account: 'codex', commit: 'c0ffee1', ...record },
+    context: 'Tu tarea: [T1] Sumar',
+    testCommand: 'npm test',
+    reviewEachTask: true,
+    git: true,
+    maxFixAttempts: 3,
+    ...over,
+  };
+}
+
+test('reviewTask: reviewEachTask=false, sin git o sin commit no llama al revisor', async () => {
+  for (const [rec, over] of [[{}, { reviewEachTask: false }], [{}, { git: false }], [{ commit: undefined }, {}]] as [Partial<TaskRecord>, Partial<TaskReviewInput>][]) {
+    const { deps, calls } = fakeReviewDeps(REVIEW_MIXED);
+    const input = reviewInput(rec, over);
+    assert.equal(await reviewTask(input, deps), undefined);
+    assert.equal(calls.review.length, 0);
+    assert.equal(calls.diff, 0);
+    assert.equal(input.record.review, undefined);
+  }
+});
+
+test('reviewTask: sin hallazgos high guarda la revisión y no llama al reparador', async () => {
+  const onlyMinor: Review = { ...REVIEW_MIXED, verdict: 'approve', issues: REVIEW_MIXED.issues.filter((i) => i.severity !== 'high') };
+  const { deps, calls } = fakeReviewDeps(onlyMinor);
+  const input = reviewInput();
+  const r = await reviewTask(input, deps);
+  assert.equal(r, onlyMinor);
+  assert.equal(input.record.review, onlyMinor);
+  assert.deepEqual(calls.review, ['el diff']);
+  assert.equal(calls.fix.length, 0);
+  assert.equal(calls.tests, 0);
+  assert.equal(calls.commits.length, 0);
+  assert.equal(input.record.attempts, 0);
+});
+
+test('reviewTask: hallazgos high → una reparación, re-test y commit; sin re-revisión', async () => {
+  const { deps, calls } = fakeReviewDeps(REVIEW_MIXED);
+  const input = reviewInput({ attempts: 1 });
+  await reviewTask(input, deps);
+  assert.equal(input.record.review, REVIEW_MIXED);
+  assert.equal(calls.review.length, 1);
+  assert.equal(calls.fix.length, 1);
+  assert.equal(calls.fix[0].attempt, 2);
+  assert.match(calls.fix[0].prompt, /src\/a\.ts: división por cero/);
+  assert.match(calls.fix[0].prompt, /src\/d\.ts: inyección SQL/);
+  assert.doesNotMatch(calls.fix[0].prompt, /nombre confuso|typo/);
+  assert.ok(calls.fix[0].prompt.startsWith(fixPrompt(input.context, '').split('\n\nLos tests')[0]));
+  assert.equal(calls.tests, 1);
+  assert.deepEqual(calls.commits, ['orcatech: [T1] correcciones de revisión']);
+  assert.equal(input.record.commit, 'fix1234');
+  assert.equal(input.record.attempts, 2);
+  assert.equal(input.record.status, 'passed');
+});
+
+test('reviewTask: los intentos se comparten con maxFixAttempts y, si los tests siguen fallando, la tarea queda failed', async () => {
+  const { deps, calls } = fakeReviewDeps(REVIEW_MIXED, { runTests: async () => ({ ok: false, output: 'AssertionError boom' }) });
+  const input = reviewInput({ attempts: 1 });
+  await reviewTask(input, deps);
+  assert.equal(calls.fix.length, 2);
+  assert.deepEqual(calls.fix.map((f) => f.attempt), [2, 3]);
+  assert.match(calls.fix[1].prompt, /AssertionError boom/);
+  assert.equal(input.record.attempts, 3);
+  assert.equal(input.record.status, 'failed');
+  assert.equal(calls.review.length, 1);
+  assert.ok(calls.commits.every((m) => m === 'orcatech: [T1] correcciones de revisión (tests fallando)'));
+});
+
+test('reviewTask: hallazgos high sin intentos restantes no llaman al reparador', async () => {
+  const { deps, calls } = fakeReviewDeps(REVIEW_MIXED);
+  const input = reviewInput({ attempts: 3 });
+  await reviewTask(input, deps);
+  assert.equal(input.record.review, REVIEW_MIXED);
+  assert.equal(calls.fix.length, 0);
+  assert.equal(input.record.attempts, 3);
+  assert.equal(input.record.status, 'passed');
+});
+
+test('reviewTask: sin testCommand repara una vez sin correr tests; revisión inválida no rompe', async () => {
+  const { deps, calls } = fakeReviewDeps(REVIEW_MIXED);
+  const input = reviewInput({}, { testCommand: '' });
+  await reviewTask(input, deps);
+  assert.equal(calls.fix.length, 1);
+  assert.equal(calls.tests, 0);
+  assert.equal(calls.commits.length, 1);
+
+  const invalid = fakeReviewDeps(undefined);
+  const input2 = reviewInput();
+  assert.equal(await reviewTask(input2, invalid.deps), undefined);
+  assert.equal(input2.record.review, undefined);
+  assert.equal(invalid.calls.fix.length, 0);
 });

@@ -1,7 +1,7 @@
 import { backends, type RunResult } from './backends/index.ts';
 import { ladderSpec, loadConfig, roleOverride, type OrcaConfig, type Role, type RoleConfig } from './config.ts';
 import { detectProject, type ProjectInfo } from './detect.ts';
-import { commitAll, diffSince, headCommit, isDirty, isGitRepo, startBranch } from './git.ts';
+import { commitAll, diffRange, diffSince, headCommit, isDirty, isGitRepo, startBranch } from './git.ts';
 import { runProcess } from './backends/proc.ts';
 import { runRedCheck, type RedCheckOptions, type TaskProof } from './redgreen.ts';
 import {
@@ -14,6 +14,7 @@ import {
   reviewPrompt,
   strengthenTestsPrompt,
   taskPrompt,
+  taskReviewPrompt,
   testerPrompt,
   type Plan,
   type PlanTask,
@@ -321,6 +322,97 @@ export async function proveTask(input: ProofInput, deps: ProofDeps): Promise<Tas
   return set(await check());
 }
 
+// ───────────────────────── revisión por tarea ─────────────────────────
+
+type ReviewIssue = Review['issues'][number];
+
+/** Hallazgos de severidad high de una revisión ([] si no hay revisión). */
+export function highIssues(review?: Review): ReviewIssue[] {
+  return review?.issues?.filter((i) => i.severity === 'high') ?? [];
+}
+
+/** Lista de hallazgos en texto para el reparador. */
+export function issuesText(taskId: string, issues: ReviewIssue[]): string {
+  return `Hallazgos de severidad high de la revisión de [${taskId}]:\n${issues.map((i) => `- ${i.file}: ${i.description}`).join('\n')}`;
+}
+
+export interface TaskReviewInput {
+  taskId: string;
+  /** Registro de la tarea ya commiteada (se muta: review, attempts, status, commit). */
+  record: TaskRecord;
+  /** Prompt de la tarea (contexto para el reparador). */
+  context: string;
+  testCommand?: string;
+  reviewEachTask: boolean;
+  git: boolean;
+  maxFixAttempts: number;
+}
+
+export interface TaskReviewDeps {
+  /** Diff propio de la tarea (preCommit..HEAD). */
+  diff: () => Promise<string>;
+  /** Llama al revisor con el diff; undefined si no devolvió una revisión válida. */
+  review: (diff: string) => Promise<Review | undefined>;
+  /** Llama al reparador (intento `attempt`). */
+  fix: (attempt: number, prompt: string) => Promise<unknown>;
+  runTests: () => Promise<{ ok: boolean; output: string }>;
+  commit: (message: string) => Promise<string | undefined>;
+  status: (text: string) => void;
+  log: (text: string) => void;
+  save: () => void;
+}
+
+/**
+ * Revisión del diff propio de una tarea ya commiteada. Un solo ciclo de revisión (sin re-revisión,
+ * para acotar el costo): si hay hallazgos high, el reparador los corrige usando los intentos que
+ * queden de maxFixAttempts (compartidos con las reparaciones de tests y el refuerzo red→green).
+ * Tras cada reparación se re-testea y se hace commit; si los tests pasan se termina, si fallan se
+ * reintenta con la salida de los tests. Sin intentos y con tests fallando, la tarea queda 'failed'.
+ * Devuelve la revisión, o undefined si no se revisó.
+ */
+export async function reviewTask(input: TaskReviewInput, deps: TaskReviewDeps): Promise<Review | undefined> {
+  const t = input.record;
+  if (!input.reviewEachTask || !input.git || !t.commit) return undefined;
+
+  deps.status(`Revisión de [${input.taskId}]`);
+  const review = await deps.review(await deps.diff());
+  if (!review) {
+    deps.log(`⚠ La revisión de [${input.taskId}] no devolvió un resultado válido; se continúa.`);
+    return undefined;
+  }
+  t.review = review;
+  deps.save();
+
+  const high = highIssues(review);
+  deps.log(`${high.length ? '⚠' : '✓'} Revisión de [${input.taskId}]: ${review.verdict} — ${high.length} hallazgo(s) high de ${review.issues.length}.`);
+  if (!high.length) return review;
+  if (t.attempts >= input.maxFixAttempts) {
+    deps.log(`Sin intentos de reparación restantes para los hallazgos de [${input.taskId}].`);
+    return review;
+  }
+
+  const findings = issuesText(input.taskId, high);
+  let failure = findings;
+  while (t.attempts < input.maxFixAttempts) {
+    t.attempts++;
+    await deps.fix(t.attempts, fixPrompt(input.context, failure));
+    const result = input.testCommand ? await deps.runTests() : { ok: true, output: '' };
+    const commit = await deps.commit(`orcatech: [${input.taskId}] correcciones de revisión${result.ok ? '' : ' (tests fallando)'}`);
+    if (commit) t.commit = commit;
+    if (result.ok) {
+      if (input.testCommand) t.status = 'passed';
+      deps.save();
+      return review;
+    }
+    failure = `${findings}\n\nTras corregirlos, los tests fallan:\n${result.output}`;
+    deps.save();
+  }
+  t.status = 'failed';
+  deps.save();
+  deps.log(`✗ Tras corregir los hallazgos de revisión, [${input.taskId}] no pasa sus tests: queda failed.`);
+  return review;
+}
+
 /** Cuenta para programar una tarea: elección manual > routing por tipo > rol coder. */
 function accountForTask(ctx: Active, task: PlanTask): string {
   return task.account ?? ctx.cfg.routing[task.kind] ?? ctx.state.roles.coder.account;
@@ -425,6 +517,34 @@ async function execute(ctx: Active, autoApprove: boolean): Promise<RunState> {
           save: () => saveRun(s),
         },
       );
+
+      await reviewTask(
+        {
+          taskId: task.id,
+          record: t,
+          context,
+          testCommand: plan.testCommand,
+          reviewEachTask: ctx.cfg.reviewEachTask,
+          git: !!git && !!pre,
+          maxFixAttempts: ctx.cfg.maxFixAttempts,
+        },
+        {
+          diff: () => diffRange(s.repo, pre!, 'HEAD'),
+          review: async (diff) => {
+            const r = await callAgent(ctx, 'reviewer', `Revisar [${task.id}]`, taskReviewPrompt(plan, task, diff), { schema: REVIEW_SCHEMA });
+            return r.structured ? (r.structured as Review) : undefined;
+          },
+          fix: (attempt, prompt) => {
+            const spec = fixerSpec(ctx, attempt);
+            return callAgent(ctx, 'fixer', `Corregir revisión de [${task.id}] intento ${attempt}/${ctx.cfg.maxFixAttempts}${rungLabel(spec)}`, prompt, { spec });
+          },
+          runTests: () => runTests(ctx, plan.testCommand),
+          commit: async (message) => (git ? commitAll(s.repo, message) : undefined),
+          status: (text) => setStatus(ctx, 'reviewing', text),
+          log: (text) => emit({ runId: s.id, kind: 'log', text }),
+          save: () => saveRun(s),
+        },
+      );
     }
 
     // 4. Test de aceptación de afuera hacia adentro.
@@ -438,7 +558,7 @@ async function execute(ctx: Active, autoApprove: boolean): Promise<RunState> {
     const diff = git && s.baseRef ? await diffSince(s.repo, s.baseRef) : '(sin git: revisa los archivos modificados)';
     const rev = await callAgent(ctx, 'reviewer', 'Revisión', reviewPrompt(plan, diff), { schema: REVIEW_SCHEMA });
     if (rev.structured) s.review = rev.structured as Review;
-    const serious = s.review?.issues.filter((i) => i.severity === 'high') ?? [];
+    const serious = highIssues(s.review);
     const failingCriteria = s.testReport?.criteria.filter((c) => c.status === 'fail') ?? [];
     if (serious.length || failingCriteria.length) {
       const issues = [
