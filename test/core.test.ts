@@ -7,11 +7,11 @@ import { execFileSync } from 'node:child_process';
 import { accountEnv, extractJson } from '../src/backends/types.ts';
 import { DEFAULT_CONFIG, ladderSpec, loadConfig, roleOverride } from '../src/config.ts';
 import { detectProject } from '../src/detect.ts';
-import { resolveFixerRole } from '../src/pipeline.ts';
-import { PLAN_SCHEMA, REVIEW_SCHEMA, TEST_SCHEMA } from '../src/prompts.ts';
+import { proveTask, proofLogText, resolveFixerRole, type ProofDeps, type ProofInput } from '../src/pipeline.ts';
+import { PLAN_SCHEMA, REVIEW_SCHEMA, TEST_SCHEMA, strengthenTestsPrompt } from '../src/prompts.ts';
 import { changedFiles, diffRange, headCommit, showFile } from '../src/git.ts';
 import { classifyRedRun, isTestFile, newSourceFiles, pickTestFiles, runRedCheck } from '../src/redgreen.ts';
-import type { RunState } from '../src/store.ts';
+import type { RunState, TaskProof, TaskRecord } from '../src/store.ts';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'orcatech-test-'));
 
@@ -342,4 +342,171 @@ test('runRedCheck limpia el worktree aunque el comando falle o el commit no exis
   const bad = await redCheck(repo, '0'.repeat(40), post, 'true');
   assert.equal(bad.status, 'inconclusive');
   assert.ok(bad.detail.length > 0);
+});
+
+// ---- Integración de la prueba red→green en el loop de tareas (proveTask) ----
+
+test('strengthenTestsPrompt está en español e incluye los archivos de test y el detail', () => {
+  const p = strengthenTestsPrompt('Tu tarea: [T9] Algo', { detail: 'Los tests pasan sobre el código previo.', testFiles: ['test/a.test.ts', 'test/b.test.ts'] });
+  assert.match(p, /Tu tarea: \[T9\] Algo/);
+  assert.match(p, /test\/a\.test\.ts/);
+  assert.match(p, /test\/b\.test\.ts/);
+  assert.match(p, /Los tests pasan sobre el código previo\./);
+  assert.match(p, /Refuerza/);
+  assert.match(p, /FALLEN sin la implementación/);
+  assert.match(p, /No debilites/);
+});
+
+test('proofLogText usa ✓ para proven, ⚠ para not-red y ➖ para inconclusive', () => {
+  const p = (status: TaskProof['status']): TaskProof => ({ status, detail: 'd', testFiles: [] });
+  assert.match(proofLogText('T1', p('proven')), /^✓ .*\[T1\].*proven/);
+  assert.match(proofLogText('T1', p('not-red')), /^⚠ /);
+  assert.match(proofLogText('T1', p('inconclusive')), /^➖ /);
+});
+
+/** Dependencias falsas que registran cada llamada. */
+function fakeDeps(proofs: (TaskProof | Error)[], over: Partial<ProofDeps> = {}) {
+  const calls = { redCheck: [] as { preCommit: string; postCommit: string }[], fix: [] as { attempt: number; prompt: string }[], commits: [] as string[], tests: 0, saves: 0, logs: [] as string[] };
+  let head = 0;
+  const deps: ProofDeps = {
+    redCheck: async (o) => {
+      calls.redCheck.push({ preCommit: o.preCommit, postCommit: o.postCommit });
+      const next = proofs.shift() ?? { status: 'proven', detail: 'ok', testFiles: [] };
+      if (next instanceof Error) throw next;
+      return next;
+    },
+    head: async () => `post${++head}`,
+    fix: async (attempt, prompt) => void calls.fix.push({ attempt, prompt }),
+    runTests: async () => (calls.tests++, { ok: true, output: '' }),
+    commit: async (m) => (calls.commits.push(m), 'abc1234'),
+    status: () => undefined,
+    log: (t) => void calls.logs.push(t),
+    save: () => void calls.saves++,
+    ...over,
+  };
+  return { deps, calls };
+}
+
+function proofInput(record: Partial<TaskRecord> = {}, over: Partial<ProofInput> = {}): ProofInput {
+  return {
+    taskId: 'T1',
+    record: { status: 'passed', attempts: 0, account: 'codex', commit: 'c0ffee1', ...record },
+    context: 'Tu tarea: [T1] Sumar',
+    repo: '/no/importa',
+    testCommand: 'npm test',
+    preCommit: 'pre',
+    redGreen: true,
+    git: true,
+    maxFixAttempts: 3,
+    ...over,
+  };
+}
+
+test('proveTask: redGreen=false, sin git o sin testCommand → skipped sin correr la prueba', async () => {
+  for (const over of [{ redGreen: false }, { git: false, preCommit: undefined }, { testCommand: '' }]) {
+    const { deps, calls } = fakeDeps([]);
+    const input = proofInput({}, over);
+    const proof = await proveTask(input, deps);
+    assert.equal(proof.status, 'skipped', JSON.stringify(over));
+    assert.equal(input.record.proof?.status, 'skipped');
+    assert.ok(proof.detail.length > 0);
+    assert.equal(calls.redCheck.length, 0);
+    assert.ok(calls.saves > 0);
+  }
+  // Tarea fallida → skipped; tarea sin commit → no-tests.
+  assert.equal((await proveTask(proofInput({ status: 'failed' }), fakeDeps([]).deps)).status, 'skipped');
+  const noCommit = fakeDeps([]);
+  assert.equal((await proveTask(proofInput({ commit: undefined }), noCommit.deps)).status, 'no-tests');
+  assert.equal(noCommit.calls.redCheck.length, 0);
+});
+
+test('proveTask: proven queda registrado y no llama al reparador', async () => {
+  const { deps, calls } = fakeDeps([{ status: 'proven', detail: 'falla antes', testFiles: ['test/a.test.ts'] }]);
+  const input = proofInput();
+  const proof = await proveTask(input, deps);
+  assert.equal(proof.status, 'proven');
+  assert.equal(input.record.proof?.status, 'proven');
+  assert.deepEqual(calls.redCheck, [{ preCommit: 'pre', postCommit: 'post1' }]);
+  assert.equal(calls.fix.length, 0);
+  assert.equal(input.record.attempts, 0);
+  assert.ok(calls.logs.some((l) => l.startsWith('✓ ')));
+});
+
+test('proveTask: not-red → un refuerzo del reparador, attempts+1, commit y se repite la prueba con el mismo pre', async () => {
+  const notRed: TaskProof = { status: 'not-red', detail: 'pasan sobre el código previo', testFiles: ['test/a.test.ts'] };
+  const { deps, calls } = fakeDeps([notRed, { status: 'proven', detail: 'ahora falla antes', testFiles: ['test/a.test.ts'] }]);
+  const input = proofInput({ attempts: 1 });
+  const proof = await proveTask(input, deps);
+  assert.equal(proof.status, 'proven');
+  assert.equal(input.record.proof?.status, 'proven');
+  assert.equal(input.record.attempts, 2);
+  assert.equal(calls.fix.length, 1);
+  assert.equal(calls.fix[0].attempt, 2);
+  assert.equal(calls.fix[0].prompt, strengthenTestsPrompt(input.context, notRed));
+  assert.equal(calls.tests, 1);
+  assert.deepEqual(calls.commits, ['orcatech: [T1] refuerzo de tests']);
+  assert.equal(input.record.commit, 'abc1234');
+  assert.deepEqual(calls.redCheck, [
+    { preCommit: 'pre', postCommit: 'post1' },
+    { preCommit: 'pre', postCommit: 'post2' },
+  ]);
+  assert.ok(calls.logs.some((l) => l.startsWith('⚠ ')));
+});
+
+test('proveTask: not-red repetido no vuelve a llamar al reparador (una sola vez)', async () => {
+  const notRed: TaskProof = { status: 'not-red', detail: 'x', testFiles: [] };
+  const { deps, calls } = fakeDeps([notRed, notRed]);
+  const input = proofInput();
+  assert.equal((await proveTask(input, deps)).status, 'not-red');
+  assert.equal(calls.fix.length, 1);
+  assert.equal(calls.redCheck.length, 2);
+  assert.equal(input.record.attempts, 1);
+});
+
+test('proveTask: not-red sin intentos restantes se conserva sin llamar al reparador', async () => {
+  const { deps, calls } = fakeDeps([{ status: 'not-red', detail: 'x', testFiles: [] }]);
+  const input = proofInput({ attempts: 3 });
+  const proof = await proveTask(input, deps);
+  assert.equal(proof.status, 'not-red');
+  assert.equal(input.record.proof?.status, 'not-red');
+  assert.equal(input.record.attempts, 3);
+  assert.equal(calls.fix.length, 0);
+  assert.equal(calls.redCheck.length, 1);
+});
+
+test('proveTask: si los tests dejan de pasar tras el refuerzo, la tarea queda failed', async () => {
+  const { deps, calls } = fakeDeps([{ status: 'not-red', detail: 'x', testFiles: [] }], { runTests: async () => ({ ok: false, output: 'boom' }) });
+  const input = proofInput();
+  await proveTask(input, deps);
+  assert.equal(input.record.status, 'failed');
+  assert.equal(input.record.attempts, 1);
+  assert.equal(calls.redCheck.length, 1);
+  assert.match(calls.commits[0], /refuerzo de tests \(tests fallando\)/);
+});
+
+test('proveTask: una excepción en la prueba no corta la corrida → inconclusive', async () => {
+  const { deps } = fakeDeps([new Error('worktree roto')]);
+  const input = proofInput();
+  const proof = await proveTask(input, deps);
+  assert.equal(proof.status, 'inconclusive');
+  assert.match(proof.detail, /worktree roto/);
+  assert.equal(input.record.proof?.status, 'inconclusive');
+
+  const headFails = fakeDeps([], { head: async () => { throw new Error('sin HEAD'); } });
+  assert.equal((await proveTask(proofInput(), headFails.deps)).status, 'inconclusive');
+});
+
+test('proveTask con git real: la tarea cuyo test falla en el commit previo queda proven', async () => {
+  const repo = gitRepo();
+  put(repo, { 'src/sum.js': SUM_BUG });
+  const pre = commit(repo, 'sum con bug');
+  put(repo, { 'src/sum.js': SUM_OK, 'test/sum.test.js': SUM_TEST });
+  const post = commit(repo, '[T1] corrige sum');
+  const { deps, calls } = fakeDeps([], { redCheck: (o) => runRedCheck({ ...o, timeoutMs: 60_000 }), head: headCommit });
+  const input = proofInput({ commit: post.slice(0, 7) }, { repo, preCommit: pre, testCommand: 'node --test test/*.test.js' });
+  const proof = await proveTask(input, deps);
+  assert.equal(proof.status, 'proven', proof.detail);
+  assert.deepEqual(proof.testFiles, ['test/sum.test.js']);
+  assert.equal(calls.fix.length, 0);
+  assert.equal(worktrees(repo).length, 1);
 });

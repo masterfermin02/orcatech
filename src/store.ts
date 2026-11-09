@@ -43,6 +43,10 @@ export interface TaskRecord {
   commit?: string;
   /** Resultado de la prueba red→green de la tarea (ausente en corridas antiguas). */
   proof?: TaskProof;
+  /** HEAD antes de que el programador tocara la tarea (solo con git). */
+  preCommit?: string;
+  /** Revisión del diff propio de la tarea (si reviewEachTask). */
+  review?: Review;
 }
 
 export interface RunState {

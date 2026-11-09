@@ -1,8 +1,9 @@
 import { backends, type RunResult } from './backends/index.ts';
 import { ladderSpec, loadConfig, roleOverride, type OrcaConfig, type Role, type RoleConfig } from './config.ts';
 import { detectProject, type ProjectInfo } from './detect.ts';
-import { commitAll, diffSince, isDirty, isGitRepo, startBranch } from './git.ts';
+import { commitAll, diffSince, headCommit, isDirty, isGitRepo, startBranch } from './git.ts';
 import { runProcess } from './backends/proc.ts';
+import { runRedCheck, type RedCheckOptions, type TaskProof } from './redgreen.ts';
 import {
   INSTRUCTIONS,
   PLAN_SCHEMA,
@@ -11,6 +12,7 @@ import {
   fixPrompt,
   planPrompt,
   reviewPrompt,
+  strengthenTestsPrompt,
   taskPrompt,
   testerPrompt,
   type Plan,
@@ -18,7 +20,7 @@ import {
   type Review,
   type TestReport,
 } from './prompts.ts';
-import { emit, loadRun, newRunId, saveRun, writeArtifact, type RunState, type RunStatus } from './store.ts';
+import { emit, loadRun, newRunId, saveRun, writeArtifact, type RunState, type RunStatus, type TaskRecord } from './store.ts';
 
 export interface StartOptions {
   idea: string;
@@ -211,6 +213,114 @@ async function runTests(ctx: Active, command: string): Promise<{ ok: boolean; ou
   return { ok: r.code === 0, output: tail };
 }
 
+// ───────────────────────── prueba red→green ─────────────────────────
+
+export interface ProofInput {
+  taskId: string;
+  /** Registro de la tarea ya testeada y con su commit (se muta: proof, attempts, status, commit). */
+  record: TaskRecord;
+  /** Prompt de la tarea (contexto para el reparador). */
+  context: string;
+  repo: string;
+  testCommand?: string;
+  preCommit?: string;
+  redGreen: boolean;
+  git: boolean;
+  maxFixAttempts: number;
+  signal?: AbortSignal;
+}
+
+export interface ProofDeps {
+  redCheck: (opts: RedCheckOptions) => Promise<TaskProof>;
+  head: (repo: string) => Promise<string>;
+  /** Llama al reparador (intento `attempt`) con el prompt de refuerzo. */
+  fix: (attempt: number, prompt: string) => Promise<unknown>;
+  runTests: () => Promise<{ ok: boolean; output: string }>;
+  commit: (message: string) => Promise<string | undefined>;
+  status: (text: string) => void;
+  log: (text: string) => void;
+  save: () => void;
+}
+
+/** Motivo para no correr la prueba, o undefined si corresponde correrla. */
+export function proofSkip(input: Pick<ProofInput, 'record' | 'testCommand' | 'preCommit' | 'redGreen' | 'git'>): TaskProof | undefined {
+  const skipped = (detail: string): TaskProof => ({ status: 'skipped', detail, testFiles: [] });
+  if (!input.redGreen) return skipped('Prueba red→green desactivada (redGreen: false).');
+  if (!input.git) return skipped('Sin git: no hay commit previo con el cual comparar.');
+  if (!input.testCommand) return skipped('El plan no tiene comando de tests.');
+  if (input.record.status !== 'passed') return skipped('La tarea no pasó sus tests.');
+  if (!input.preCommit) return skipped('No se registró el commit previo a la tarea.');
+  if (!input.record.commit) return { status: 'no-tests', detail: 'La tarea no generó cambios (sin commit).', testFiles: [] };
+  return undefined;
+}
+
+export function proofLogText(taskId: string, proof: TaskProof): string {
+  const icon = proof.status === 'proven' ? '✓' : proof.status === 'not-red' ? '⚠' : '➖';
+  return `${icon} Prueba red→green de [${taskId}]: ${proof.status} — ${proof.detail}`;
+}
+
+/**
+ * Prueba red→green de una tarea ya commiteada. Si sale not-red y quedan intentos,
+ * el reparador refuerza los tests una vez (cuenta para maxFixAttempts), se re-testea,
+ * se hace commit y se repite la prueba con el mismo commit previo.
+ * Nunca lanza por fallos de la prueba en sí (quedan 'inconclusive'); sí propaga los
+ * errores del reparador (cancelación, tope de gasto), como el resto del pipeline.
+ */
+export async function proveTask(input: ProofInput, deps: ProofDeps): Promise<TaskProof> {
+  const t = input.record;
+  const set = (proof: TaskProof) => {
+    t.proof = proof;
+    deps.save();
+    deps.log(proofLogText(input.taskId, proof));
+    return proof;
+  };
+
+  const skip = proofSkip(input);
+  if (skip) {
+    t.proof = skip;
+    deps.save();
+    return skip;
+  }
+
+  const check = async (): Promise<TaskProof> => {
+    try {
+      const post = await deps.head(input.repo);
+      return await deps.redCheck({
+        repo: input.repo,
+        preCommit: input.preCommit!,
+        postCommit: post,
+        testCommand: input.testCommand!,
+        signal: input.signal,
+      });
+    } catch (e) {
+      return { status: 'inconclusive', detail: `La prueba red→green falló: ${e instanceof Error ? e.message : String(e)}`, testFiles: [] };
+    }
+  };
+
+  deps.status(`Prueba red→green de [${input.taskId}]`);
+  const proof = set(await check());
+  if (proof.status !== 'not-red') return proof;
+  if (t.attempts >= input.maxFixAttempts) {
+    deps.log(`Sin intentos de reparación restantes para reforzar los tests de [${input.taskId}]; queda not-red.`);
+    return proof;
+  }
+
+  t.attempts++;
+  await deps.fix(t.attempts, strengthenTestsPrompt(input.context, proof));
+  const result = await deps.runTests();
+  const commit = await deps.commit(`orcatech: [${input.taskId}] refuerzo de tests${result.ok ? '' : ' (tests fallando)'}`);
+  if (commit) t.commit = commit;
+  if (!result.ok) {
+    t.status = 'failed';
+    deps.save();
+    deps.log(`✗ Tras reforzar los tests, [${input.taskId}] ya no pasa: queda failed.`);
+    return proof;
+  }
+  deps.save();
+  deps.status(`Prueba red→green de [${input.taskId}] (tras refuerzo)`);
+  return set(await check());
+}
+
 /** Cuenta para programar una tarea: elección manual > routing por tipo > rol coder. */
 function accountForTask(ctx: Active, task: PlanTask): string {
   return task.account ?? ctx.cfg.routing[task.kind] ?? ctx.state.roles.coder.account;
@@ -259,6 +369,9 @@ async function execute(ctx: Active, autoApprove: boolean): Promise<RunState> {
       const t = s.tasks[task.id];
       setStatus(ctx, 'coding', `[${task.id}] ${task.title}`);
       t.status = 'running';
+      const pre = git ? await headCommit(s.repo) : undefined;
+      t.preCommit = pre;
+      saveRun(s);
       const context = taskPrompt(plan, task, ctx.info);
       const code = await callAgent(ctx, 'coder', `Programar [${task.id}] ${task.title}`, context, { account: t.account });
       if (!code.ok) emit({ runId: s.id, kind: 'error', text: `El programador reportó un error; se intentará reparar.` });
@@ -284,6 +397,34 @@ async function execute(ctx: Active, autoApprove: boolean): Promise<RunState> {
       t.status = passed ? 'passed' : 'failed';
       if (git) t.commit = await commitAll(s.repo, `orcatech: [${task.id}] ${task.title}${passed ? '' : ' (tests fallando)'}`);
       saveRun(s);
+
+      await proveTask(
+        {
+          taskId: task.id,
+          record: t,
+          context,
+          repo: s.repo,
+          testCommand: plan.testCommand,
+          preCommit: pre,
+          redGreen: ctx.cfg.redGreen,
+          git: !!git,
+          maxFixAttempts: ctx.cfg.maxFixAttempts,
+          signal: ctx.abort.signal,
+        },
+        {
+          redCheck: runRedCheck,
+          head: headCommit,
+          fix: (attempt, prompt) => {
+            const spec = fixerSpec(ctx, attempt);
+            return callAgent(ctx, 'fixer', `Reforzar tests de [${task.id}] intento ${attempt}/${ctx.cfg.maxFixAttempts}${rungLabel(spec)}`, prompt, { spec });
+          },
+          runTests: () => runTests(ctx, plan.testCommand),
+          commit: async (message) => (git ? commitAll(s.repo, message) : undefined),
+          status: (text) => setStatus(ctx, 'testing', text),
+          log: (text) => emit({ runId: s.id, kind: 'log', text }),
+          save: () => saveRun(s),
+        },
+      );
     }
 
     // 4. Test de aceptación de afuera hacia adentro.

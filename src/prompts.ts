@@ -1,5 +1,6 @@
 import type { ProjectInfo } from './detect.ts';
 import type { Role } from './config.ts';
+import type { TaskProof } from './redgreen.ts';
 
 // Esquemas estrictos (todas las propiedades requeridas, sin extras): los aceptan Claude y Codex.
 const str = { type: 'string' } as const;
@@ -129,6 +130,23 @@ ${projectContext(info)}`;
 
 export function fixPrompt(context: string, failure: string): string {
   return `${context}\n\nLos tests fallan. Salida (recortada):\n\n\`\`\`\n${failure}\n\`\`\`\n\nCorrige la causa raíz y vuelve a correr los tests.`;
+}
+
+/** Pide al reparador reforzar los tests de una tarea cuya prueba red→green salió not-red. */
+export function strengthenTestsPrompt(context: string, proof: Pick<TaskProof, 'detail' | 'testFiles'>): string {
+  const files = proof.testFiles.length ? proof.testFiles.map((f) => `- ${f}`).join('\n') : '- (no se detectaron archivos de test)';
+  return `${context}
+
+La tarea ya está implementada y sus tests pasan, pero la prueba red→green indica que esos tests NO demuestran el cambio:
+${proof.detail}
+
+Archivos de test de la tarea:
+${files}
+
+Refuerza esos tests o agrega tests nuevos que FALLEN sin la implementación de esta tarea (sobre el código previo a la tarea) y PASEN con ella.
+Comprueba el comportamiento observable que introduce la tarea con aserciones concretas.
+No debilites, saltes ni borres los tests existentes, y no cambies el código de la aplicación salvo que sea imprescindible.
+Corre los tests antes de terminar.`;
 }
 
 export function testerPrompt(plan: Plan, info: ProjectInfo): string {
