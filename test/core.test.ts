@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { accountEnv, extractJson } from '../src/backends/types.ts';
 import { DEFAULT_CONFIG, ladderSpec, loadConfig, roleOverride } from '../src/config.ts';
 import { detectProject } from '../src/detect.ts';
+import { resolveFixerRole } from '../src/pipeline.ts';
 import { PLAN_SCHEMA, REVIEW_SCHEMA, TEST_SCHEMA } from '../src/prompts.ts';
 import { changedFiles, diffRange, headCommit, showFile } from '../src/git.ts';
 import { classifyRedRun, isTestFile, newSourceFiles, pickTestFiles, runRedCheck } from '../src/redgreen.ts';
@@ -87,6 +88,33 @@ test('ladderSpec elige el escalón según el intento', () => {
   assert.equal(ladderSpec(['a', 'b'], 5), 'b');
   assert.equal(ladderSpec(['a', 'b'], 0), 'a');
   assert.equal(ladderSpec(['a', 'b'], -3), 'a');
+});
+
+test('resolveFixerRole sin fixerLadder devuelve exactamente roles.fixer', () => {
+  const roles = DEFAULT_CONFIG.roles;
+  for (const attempt of [1, 2, 5]) {
+    assert.equal(resolveFixerRole({ accounts: DEFAULT_CONFIG.accounts }, roles, attempt), roles.fixer);
+    assert.equal(resolveFixerRole({ accounts: DEFAULT_CONFIG.accounts, fixerLadder: [] }, roles, attempt), roles.fixer);
+  }
+});
+
+test('resolveFixerRole aplica el escalón de la escalera según el intento', () => {
+  const cfg = { accounts: DEFAULT_CONFIG.accounts, fixerLadder: ['codex', 'claude-personal:claude-opus-5-5'] };
+  const roles = { ...DEFAULT_CONFIG.roles, fixer: { account: 'claude-work', model: 'claude-sonnet-5-5', effort: 'high' as const, maxBudgetUsd: 2 } };
+
+  const first = resolveFixerRole(cfg, roles, 1);
+  assert.equal(first.account, 'codex');
+  assert.equal(first.model, undefined); // el modelo de Claude no aplica en codex
+  assert.equal(first.maxBudgetUsd, 2);
+
+  for (const attempt of [2, 5]) {
+    const r = resolveFixerRole(cfg, roles, attempt);
+    assert.equal(r.account, 'claude-personal');
+    assert.equal(r.model, 'claude-opus-5-5');
+    assert.equal(r.effort, 'high');
+  }
+  // No muta el rol base.
+  assert.equal(roles.fixer.account, 'claude-work');
 });
 
 test('detectProject reconoce Laravel, juego de navegador y Python', () => {

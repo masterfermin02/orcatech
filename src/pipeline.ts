@@ -1,5 +1,5 @@
 import { backends, type RunResult } from './backends/index.ts';
-import { loadConfig, type OrcaConfig, type Role, type RoleConfig } from './config.ts';
+import { ladderSpec, loadConfig, roleOverride, type OrcaConfig, type Role, type RoleConfig } from './config.ts';
 import { detectProject, type ProjectInfo } from './detect.ts';
 import { commitAll, diffSince, isDirty, isGitRepo, startBranch } from './git.ts';
 import { runProcess } from './backends/proc.ts';
@@ -104,14 +104,17 @@ async function callAgent(
   role: Role,
   title: string,
   prompt: string,
-  extra: { schema?: Record<string, unknown>; account?: string } = {},
+  extra: { schema?: Record<string, unknown>; account?: string; spec?: string } = {},
 ): Promise<RunResult> {
   if (ctx.abort.signal.aborted) throw new Error('cancelado');
   if (overBudget(ctx)) throw new Error(`Se alcanzó el tope de gasto de la corrida (US$${ctx.cfg.maxRunBudgetUsd})`);
 
-  const roleCfg: RoleConfig = extra.account
-    ? { ...ctx.state.roles[role], account: extra.account, model: sameBackend(ctx, extra.account, ctx.state.roles[role].account) ? ctx.state.roles[role].model : undefined }
-    : ctx.state.roles[role];
+  const base = ctx.state.roles[role];
+  const roleCfg: RoleConfig = extra.spec
+    ? roleOverride(base, extra.spec, ctx.cfg.accounts)
+    : extra.account
+      ? { ...base, account: extra.account, model: sameBackend(ctx, extra.account, base.account) ? base.model : undefined }
+      : base;
   const account = ctx.cfg.accounts[roleCfg.account];
   const backend = backends[account.backend];
   const access = role === 'planner' || role === 'reviewer' ? 'read' : 'write';
@@ -164,6 +167,30 @@ async function callAgent(
     text: res.ok ? `✓ ${title}${res.costUsd ? ` · US$${res.costUsd.toFixed(2)}` : ''}` : `✗ ${title}: ${res.error ?? 'falló'}`,
   });
   return res;
+}
+
+/**
+ * Rol efectivo del fixer para el intento `attempt` (empieza en 1).
+ * Sin fixerLadder devuelve roles.fixer tal cual; con escalera aplica
+ * ladder[min(attempt-1, len-1)] sobre roles.fixer.
+ */
+export function resolveFixerRole(
+  cfg: Pick<OrcaConfig, 'fixerLadder' | 'accounts'>,
+  roles: Record<Role, RoleConfig>,
+  attempt: number,
+): RoleConfig {
+  const spec = ladderSpec(cfg.fixerLadder, attempt);
+  return spec ? roleOverride(roles.fixer, spec, cfg.accounts) : roles.fixer;
+}
+
+/** Spec 'cuenta[:modelo]' del escalón del fixer para este intento, o undefined sin escalera. */
+function fixerSpec(ctx: Active, attempt: number): string | undefined {
+  return ladderSpec(ctx.cfg.fixerLadder, attempt);
+}
+
+/** Sufijo del título del paso con el escalón usado, p. ej. " (codex)". */
+function rungLabel(spec: string | undefined): string {
+  return spec ? ` (${spec})` : '';
 }
 
 function sameBackend(ctx: Active, a: string, b: string) {
@@ -242,7 +269,14 @@ async function execute(ctx: Active, autoApprove: boolean): Promise<RunState> {
         let result = await runTests(ctx, plan.testCommand);
         while (!result.ok && t.attempts < ctx.cfg.maxFixAttempts) {
           t.attempts++;
-          await callAgent(ctx, 'fixer', `Reparar [${task.id}] intento ${t.attempts}/${ctx.cfg.maxFixAttempts}`, fixPrompt(context, result.output));
+          const spec = fixerSpec(ctx, t.attempts);
+          await callAgent(
+            ctx,
+            'fixer',
+            `Reparar [${task.id}] intento ${t.attempts}/${ctx.cfg.maxFixAttempts}${rungLabel(spec)}`,
+            fixPrompt(context, result.output),
+            { spec },
+          );
           result = await runTests(ctx, plan.testCommand);
         }
         passed = result.ok;
@@ -270,7 +304,14 @@ async function execute(ctx: Active, autoApprove: boolean): Promise<RunState> {
         ...serious.map((i) => `- [revisión] ${i.file}: ${i.description}`),
         ...failingCriteria.map((c) => `- [aceptación] ${c.criterion}: ${c.evidence}`),
       ].join('\n');
-      await callAgent(ctx, 'fixer', 'Corregir hallazgos de revisión/aceptación', fixPrompt(`Objetivo: ${plan.summary}\n\nHallazgos a corregir:\n${issues}`, s.testReport?.summary ?? ''));
+      const spec = fixerSpec(ctx, 1);
+      await callAgent(
+        ctx,
+        'fixer',
+        `Corregir hallazgos de revisión/aceptación${rungLabel(spec)}`,
+        fixPrompt(`Objetivo: ${plan.summary}\n\nHallazgos a corregir:\n${issues}`, s.testReport?.summary ?? ''),
+        { spec },
+      );
       if (plan.testCommand) await runTests(ctx, plan.testCommand);
       if (git) await commitAll(s.repo, 'orcatech: correcciones de revisión');
     }
