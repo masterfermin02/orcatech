@@ -50,6 +50,10 @@ export const claudeBackend: Backend = {
           // total_cost_usd es acumulativo: se toma el último, no se suma.
           costUsd = m.total_cost_usd;
           tokens = { input: m.usage.input_tokens, output: m.usage.output_tokens };
+          if (m.permission_denials?.length) {
+            const names = m.permission_denials.map((d) => d.tool_name).join(', ');
+            req.onEvent?.({ kind: 'info', text: `⚠ ${m.permission_denials.length} uso(s) de herramienta denegado(s) por permisos: ${names}` });
+          }
           if (m.subtype === 'success') {
             ok = !m.is_error;
             text = m.result;
